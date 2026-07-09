@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MX11 Marketplace Compatibility Scanner</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        colors: {
+          'mx-blue': '#0595DB',
+          'mx-navy': '#0A1D3F',
+          'dark': { 'bg': '#0E1419', 'surface': '#161B22', 'border': '#30363D', 'hover': '#1C2128' }
+        }
+      }
+    }
+  }
+</script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  .nav-link { display:flex; align-items:center; gap:0.75rem; padding:0.625rem 0.75rem; border-radius:0.5rem; font-size:0.875rem; color:rgb(156 163 175); cursor:pointer; transition:all 0.2s; text-decoration:none; }
+  .nav-link:hover { background-color:#1C2128; color:rgb(229 231 235); }
+  .nav-link.active { background-color:#0595DB; color:white; box-shadow:0 10px 15px -3px rgba(5,149,219,0.2); }
+  .view.active { display:block; }
+  /* id selector beats .view.active so the loading spinner/bar stays centered */
+  #loading-view.active { display:flex; }
+  .filter-btn { padding:0.375rem 0.75rem; border-radius:0.5rem; font-size:0.75rem; font-weight:500; background-color:#161B22; border:1px solid #30363D; color:rgb(156 163 175); cursor:pointer; transition:all 0.2s; }
+  .filter-btn:hover { background-color:#1C2128; color:rgb(229 231 235); }
+  .filter-btn.active { background-color:#0595DB; border-color:#0595DB; color:white; }
+  /* Java source code viewer */
+  .code-viewer { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.5; }
+  .code-viewer .code-line { display:flex; white-space:pre; }
+  .code-viewer .code-gutter { user-select:none; text-align:right; padding:0 0.75rem 0 0.5rem; color:#6b7280; flex-shrink:0; min-width:3rem; border-right:1px solid #30363D; }
+  .code-viewer .code-content { padding:0 0.75rem; flex:1; }
+  .code-viewer .code-line.hl { background-color:rgba(239,68,68,0.12); }
+  .code-viewer .code-line.hl .code-gutter { color:#f87171; background-color:rgba(239,68,68,0.18); border-right-color:rgba(239,68,68,0.5); }
+</style>
+</head>
+<body class="bg-dark-bg text-gray-100 antialiased">
+  <div class="flex h-screen overflow-hidden">
+    <!-- Sidebar -->
+    <aside class="w-56 bg-dark-surface border-r border-dark-border flex flex-col flex-shrink-0">
+      <div class="p-5 border-b border-dark-border">
+        <h1 class="text-base font-semibold text-white leading-tight">MX11 Marketplace Scanner</h1>
+        <p class="text-xs text-gray-500 mt-1">Compatibility Analysis</p>
+      </div>
+      <nav class="flex-1 px-2 py-3 space-y-0.5 overflow-y-auto">
+        <a href="#" class="nav-link active" data-view="dashboard">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+          </svg>
+          <span>Dashboard</span>
+        </a>
+        <a href="#" class="nav-link" data-view="components">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/>
+          </svg>
+          <span>Components</span>
+        </a>
+        <a href="#" class="nav-link" data-view="widgets">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z"/>
+          </svg>
+          <span>Widgets</span>
+        </a>
+        <a href="#" class="nav-link" data-view="modules">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/>
+          </svg>
+          <span>Modules</span>
+        </a>
+        <a href="#" class="nav-link" data-view="starter-apps">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+          </svg>
+          <span>Starter Apps</span>
+        </a>
+        <a href="#" class="nav-link" data-view="issues">
+          <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+          </svg>
+          <span>Issues</span>
+        </a>
+      </nav>
+      <div id="scan-date" class="px-4 py-3 border-t border-dark-border text-xs text-gray-500"></div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="flex-1 overflow-y-auto bg-dark-bg">
+      <!-- Loading View -->
+      <div id="loading-view" class="view active flex items-center justify-center h-full">
+        <div class="text-center w-72">
+          <div class="inline-block animate-spin rounded-full h-10 w-10 border-2 border-mx-blue border-t-transparent"></div>
+          <p id="loading-text" class="mt-4 text-sm text-gray-400">Loading data...</p>
+          <div class="mt-3 h-1.5 w-full rounded-full bg-dark-border overflow-hidden">
+            <div id="loading-bar" class="h-full bg-mx-blue transition-[width] duration-150 ease-out" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Views -->
+      <div id="dashboard-view"   class="view hidden"></div>
+      <div id="components-view"  class="view hidden"></div>
+      <div id="widgets-view"     class="view hidden"></div>
+      <div id="modules-view"     class="view hidden"></div>
+      <div id="starter-apps-view" class="view hidden"></div>
+      <div id="issues-view"      class="view hidden"></div>
+      <div id="component-detail-view" class="view hidden"></div>
+      <div id="widget-detail-view"    class="view hidden"></div>
+      <div id="module-detail-view"    class="view hidden"></div>
+      <div id="issue-detail-view"     class="view hidden"></div>
+    </main>
+  </div>
+
+  <script src="scan-meta.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.7/purify.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>
+    function setProgress(pct, label) {
+      const bar = document.getElementById('loading-bar');
+      const txt = document.getElementById('loading-text');
+      if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+      if (txt && label) txt.textContent = label;
+    }
+
+    // Fetch the gzipped .db over HTTP and inflate it in the browser. SQLite
+    // pages compress ~8x, so this downloads ~8 MB instead of ~64 MB. We fetch
+    // the .gz explicitly (not via transparent Content-Encoding) so content-length
+    // reflects the bytes actually on the wire and the progress bar stays honest.
+    // DecompressionStream is native in all current browsers — no library needed.
+    async function fetchDbWithProgress() {
+      const resp = await fetch('analysis.db.gz');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const total = Number(resp.headers.get('content-length')) || 0;
+      if (!resp.body) {
+        setProgress(90, 'Loading data...');
+        const buf = await resp.arrayBuffer();
+        return await gunzip(new Uint8Array(buf));
+      }
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        const mb = (received / 1048576).toFixed(1);
+        // total is the compressed size; report progress against it. Cap at 85%;
+        // the remaining slice covers inflation + DB parsing.
+        if (total) {
+          const totalMb = (total / 1048576).toFixed(1);
+          setProgress((received / total) * 85, `Loading data… ${mb} / ${totalMb} MB`);
+        } else {
+          setProgress(50, `Loading data… ${mb} MB`);
+        }
+      }
+      const compressed = new Uint8Array(received);
+      let offset = 0;
+      for (const c of chunks) { compressed.set(c, offset); offset += c.length; }
+      setProgress(88, 'Decompressing…');
+      return await gunzip(compressed);
+    }
+
+    // Inflate a gzip byte array using the native DecompressionStream.
+    async function gunzip(compressed) {
+      const ds = new DecompressionStream('gzip');
+      const stream = new Response(compressed).body.pipeThrough(ds);
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    // file:// fallback: fetch can't read local files, so decode the base64
+    // embed (loaded lazily to avoid a 81 MB parse when it isn't needed).
+    async function loadEmbeddedDb() {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'db-embedded.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('embedded DB unavailable'));
+        document.head.appendChild(s);
+      });
+      const bin = atob(window.EMBEDDED_DB);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+
+    async function initDatabase() {
+      try {
+        const SQL = await initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}` });
+        let bytes;
+        if (location.protocol === 'file:') {
+          setProgress(50, 'Loading data...');
+          bytes = await loadEmbeddedDb();
+        } else {
+          try {
+            bytes = await fetchDbWithProgress();
+          } catch (e) {
+            console.warn('Streaming .db failed, falling back to embed:', e);
+            bytes = await loadEmbeddedDb();
+          }
+        }
+        setProgress(95, 'Parsing database…');
+        db = new SQL.Database(bytes);
+        if (window.DatabaseLayer) dbLayer = new window.DatabaseLayer(db);
+        setProgress(100, 'Ready');
+        if (typeof initApp === 'function') initApp();
+      } catch (err) {
+        console.error('DB load failed:', err);
+        if (typeof showError === 'function') showError('Failed to load compatibility data.');
+      }
+    }
+    initDatabase();
+  </script>
+  <script src="db-layer.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
