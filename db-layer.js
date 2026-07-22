@@ -6,17 +6,25 @@ class DatabaseLayer {
     this.db = db;
   }
 
+  // Parse a dotted version into an array of numeric components. Handles any length
+  // (min_mx_version is 3-part like "10.24.8"; a model version is 4-part like
+  // "10.24.8.80126"; marketplace version numbers vary, e.g. "2412.225.0"). A
+  // non-numeric or empty component parses as 0.
   parseVersion(v) {
-    const cleaned = (v || '').replace(/^v/, '');
-    const parts = cleaned.split('.').map(p => parseInt(p) || 0);
-    return { major: parts[0] || 0, minor: parts[1] || 0, patch: parts[2] || 0 };
+    return (v || '').replace(/^v/, '').split('.').map(p => parseInt(p, 10) || 0);
   }
 
+  // Compare two dotted numeric versions component-by-component, treating a missing
+  // trailing component as 0 (so "2.1" == "2.1.0"). Returns >0 if a>b, <0 if a<b, 0 if
+  // equal. Must NOT be lexicographic — "10.24.8" is greater than "9.24.0".
   compareVersions(a, b) {
     const av = this.parseVersion(a), bv = this.parseVersion(b);
-    if (av.major !== bv.major) return av.major - bv.major;
-    if (av.minor !== bv.minor) return av.minor - bv.minor;
-    return av.patch - bv.patch;
+    const n = Math.max(av.length, bv.length);
+    for (let i = 0; i < n; i++) {
+      const d = (av[i] || 0) - (bv[i] || 0);
+      if (d !== 0) return d;
+    }
+    return 0;
   }
 
   query(sql, params = []) {
@@ -164,10 +172,19 @@ class DatabaseLayer {
     const modelVerSel = this.columnExists('modules', 'model_mx_version')
       ? `GROUP_CONCAT(DISTINCT NULLIF(m.model_mx_version, ''))` : `''`;
 
+    // Internal team ownership (teams table + components.team_id) was added later;
+    // guard so older embedded DBs without these still work.
+    const hasTeams = this.columnExists('components', 'team_id');
+    const teamSel = hasTeams
+      ? `t.name AS owning_team, t.group_name AS owning_group, t.unit_name AS owning_unit,`
+      : '';
+    const teamJoin = hasTeams ? `LEFT JOIN teams t ON t.id = c.team_id` : '';
+
     const rows = this.query(`
       SELECT
         c.id, c.marketplace_id, c.name, c.content_type, c.support_type,
         ${modelVerSel} AS model_mx_versions,
+        ${teamSel}
         c.min_mx_version, c.react_client_ready, c.download_count, c.rating,
         c.permalink, c.publisher, c.latest_version, c.scan_error,
         c.prod_apps_mx9, c.prod_apps_mx10,
@@ -178,6 +195,7 @@ class DatabaseLayer {
         COUNT(DISTINCT CASE WHEN w.issue_count > 0 AND NOT w.broken_always AND NOT w.breaks116 THEN w.id END) AS warning_widget_count,
         COUNT(DISTINCT CASE WHEN w.issue_count = 0 THEN w.id END)    AS compatible_widget_count,
         COUNT(DISTINCT m.id)                                          AS module_count,
+        COUNT(DISTINCT CASE WHEN COALESCE(m.has_js, 0) THEN m.id END) AS js_module_count,
         COUNT(DISTINCT CASE WHEN mf.certain THEN m.id END)           AS breaking_module_count,
         COUNT(DISTINCT mf.finding_id)                                 AS total_module_finding_count,
         COUNT(DISTINCT CASE WHEN m.has_userlib AND NOT COALESCE(m.has_managed_dependencies, 0) THEN m.id END) AS unmanaged_dep_count,
@@ -187,6 +205,7 @@ class DatabaseLayer {
       LEFT JOIN widgets w ON w.component_id = c.id
       LEFT JOIN modules m ON m.component_id = c.id
       LEFT JOIN module_findings mf ON mf.module_id = m.id
+      ${teamJoin}
       GROUP BY c.id
       ${where}
       ORDER BY
@@ -209,6 +228,13 @@ class DatabaseLayer {
          c.published_version_count, c.support_contact, c.support_website,
          c.publisher_logo, c.publisher_url, c.license_name, c.license_url, c.developers_json,`
       : '';
+    // Internal team ownership; guard for older DBs without the teams table.
+    const hasTeams = this.columnExists('components', 'team_id');
+    const teamSel = hasTeams
+      ? `t.name AS owning_team, t.group_name AS owning_group, t.unit_name AS owning_unit,
+         t.jira_project AS owning_jira, t.slack_channel AS owning_slack_channel, t.slack_url AS owning_slack_url,`
+      : '';
+    const teamJoin = hasTeams ? `LEFT JOIN teams t ON t.id = c.team_id` : '';
     return this.queryOne(`
       SELECT
         c.id, c.marketplace_id, c.name, c.content_type, c.support_type,
@@ -218,6 +244,7 @@ class DatabaseLayer {
         c.prod_apps_mx9, c.prod_apps_mx10,
         c.git_hub_url, c.last_publish_date, c.changed_date, c.created_date,
         ${richCols}
+        ${teamSel}
         COUNT(DISTINCT CASE WHEN m.has_userlib AND NOT COALESCE(m.has_managed_dependencies, 0) THEN m.id END) AS unmanaged_dep_count,
         COUNT(DISTINCT CASE WHEN m.has_userlib THEN m.id END)        AS userlib_module_count,
         COUNT(DISTINCT CASE WHEN COALESCE(m.has_managed_dependencies, 0) THEN m.id END) AS managed_dep_module_count,
@@ -226,6 +253,7 @@ class DatabaseLayer {
       FROM components c
       LEFT JOIN modules m ON m.component_id = c.id
       LEFT JOIN widgets w ON w.component_id = c.id
+      ${teamJoin}
       WHERE c.marketplace_id = ?
       GROUP BY c.id
     `, [marketplaceId]);
@@ -296,6 +324,54 @@ class DatabaseLayer {
       GROUP BY mf.id
       ORDER BY mf.certain DESC, m.name, jf.rule
     `, [componentId]);
+  }
+
+  // Experimental / future-migration findings for a component (e.g. the javax
+  // servlet/websocket migration signal). Lives in the isolated experiment_findings
+  // tables, so it never touches a finalized query. Same row shape as
+  // getComponentJavaFindings, so the Experiments-page drill-down reuses the identical
+  // file:line + snippet rendering (snippets come from the shared module_java_sources).
+  // Returns [] if the tables are absent (older embedded DBs).
+  getExperimentalFindings(componentId) {
+    if (!this._tableExists('module_experiment_findings')) return [];
+    // Locations pack file~line~snippet, records separated by X'1e'. The snippet
+    // column is empty for Java experiments (their snippet comes from
+    // module_java_sources, keyed file:line) and populated for JS experiments.
+    const rows = this.query(`
+      SELECT
+        'module' AS surface,
+        m.id AS unit_id, m.name AS unit_name, m.version AS unit_version,
+        ef.rule, ef.category, ef.description, ef.doc_url,
+        mef.id AS finding_id, mef.match_count, mef.certain,
+        GROUP_CONCAT(mefl.file_path || '~' || mefl.line_number || '~' || COALESCE(mefl.snippet, ''), X'1e') AS locations
+      FROM module_experiment_findings mef
+      JOIN modules m ON m.id = mef.module_id
+      JOIN experiment_findings ef ON ef.id = mef.finding_id
+      LEFT JOIN module_experiment_finding_locations mefl ON mefl.module_experiment_finding_id = mef.id
+      WHERE m.component_id = ?
+      GROUP BY mef.id
+      ORDER BY m.name, ef.rule
+    `, [componentId]);
+
+    // Widget experiment findings (global-mx in bundled widget JS), same shape.
+    if (this._tableExists('widget_experiment_findings')) {
+      for (const r of this.query(`
+        SELECT
+          'widget' AS surface,
+          w.id AS unit_id, COALESCE(w.display_name, w.name) AS unit_name, w.version AS unit_version,
+          ef.rule, ef.category, ef.description, ef.doc_url,
+          wef.id AS finding_id, wef.match_count, wef.certain,
+          GROUP_CONCAT(wefl.file_path || '~' || wefl.line_number || '~' || COALESCE(wefl.snippet, ''), X'1e') AS locations
+        FROM widget_experiment_findings wef
+        JOIN widgets w ON w.id = wef.widget_id
+        JOIN experiment_findings ef ON ef.id = wef.finding_id
+        LEFT JOIN widget_experiment_finding_locations wefl ON wefl.widget_experiment_finding_id = wef.id
+        WHERE w.component_id = ?
+        GROUP BY wef.id
+        ORDER BY unit_name, ef.rule
+      `, [componentId])) rows.push(r);
+    }
+    return rows;
   }
 
   // Full source of every Java file (with findings) in a component's modules,
@@ -393,6 +469,60 @@ class DatabaseLayer {
     return this.query(`SELECT DISTINCT support_type FROM components WHERE support_type IS NOT NULL ORDER BY support_type`);
   }
 
+  // Distinct owning-team names (for the Components-page team filter). Empty when
+  // the DB predates internal ownership.
+  getDistinctTeams() {
+    if (!this.columnExists('components', 'team_id')) return [];
+    return this.query(`SELECT DISTINCT name AS team FROM teams ORDER BY name`);
+  }
+
+  // Whether the dataset carries any experimental findings. The public (redacted)
+  // build empties the experiment tables, so the Experiments nav item and page have
+  // nothing to show — callers use this to hide them. Checks the module surface (the
+  // widget-experiment table is always a superset-or-equal signal, so module presence
+  // alone is a safe proxy; both are emptied together in redaction).
+  hasExperimentData() {
+    if (!this._tableExists('module_experiment_findings')) return false;
+    const rows = this.query(`SELECT COUNT(*) AS n FROM module_experiment_findings`);
+    let n = (rows[0] && rows[0].n) || 0;
+    if (n === 0 && this._tableExists('widget_experiment_findings')) {
+      const wr = this.query(`SELECT COUNT(*) AS n FROM widget_experiment_findings`);
+      n = (wr[0] && wr[0].n) || 0;
+    }
+    return n > 0;
+  }
+
+  // All internal teams that own at least one scanned component, with a component
+  // count and the aggregate compatibility breakdown across their components. Powers
+  // the Teams page. Returns [] when the DB predates internal ownership.
+  getTeams() {
+    if (!this.columnExists('components', 'team_id')) return [];
+    return this.query(`
+      SELECT
+        t.id, t.name, t.group_name, t.unit_name, t.jira_project,
+        t.slack_channel, t.slack_url,
+        COUNT(DISTINCT c.id) AS component_count,
+        COUNT(DISTINCT CASE WHEN cs.breaking THEN c.id END) AS breaking_component_count,
+        SUM(c.download_count) AS total_downloads
+      FROM teams t
+      LEFT JOIN components c ON c.team_id = t.id
+      LEFT JOIN (
+        SELECT
+          c.id,
+          (COUNT(DISTINCT CASE WHEN w.broken_always THEN w.id END) > 0
+            OR COUNT(DISTINCT CASE WHEN w.breaks116 THEN w.id END) > 0
+            OR COUNT(DISTINCT CASE WHEN mf.certain THEN m.id END) > 0) AS breaking
+        FROM components c
+        LEFT JOIN widgets w ON w.component_id = c.id
+        LEFT JOIN modules m ON m.component_id = c.id
+        LEFT JOIN module_findings mf ON mf.module_id = m.id
+        GROUP BY c.id
+      ) cs ON cs.id = c.id
+      GROUP BY t.id
+      ORDER BY breaking_component_count DESC, component_count DESC, t.name
+    `);
+  }
+
   // =============================================================================
   // Facet rollups
   // =============================================================================
@@ -440,6 +570,20 @@ class DatabaseLayer {
       WHERE COALESCE(jf.facets, '') <> ''
     `)) tally(r.cid, r.facets, r.certain);
 
+    // Experimental / future-migration findings (isolated experiment_findings tables).
+    // Tallied here so the Experiments-page facet/column status can be resolved the same
+    // way as the finalized facets — but their keys (e.g. experiment-javax) are NOT in
+    // FACET_DEFS, so componentFacetStatus never folds them into the finalized facets.
+    if (this._tableExists('module_experiment_findings')) {
+      for (const r of this.query(`
+        SELECT m.component_id AS cid, ef.facets AS facets, mef.certain AS certain
+        FROM modules m
+        JOIN module_experiment_findings mef ON mef.module_id = m.id
+        JOIN experiment_findings ef ON ef.id = mef.finding_id
+        WHERE COALESCE(ef.facets, '') <> ''
+      `)) tally(r.cid, r.facets, r.certain);
+    }
+
     // Module JavaScript-action findings (reuse the shared `findings` catalog).
     // Same facet contract as widget JS findings — the same rules produced them.
     if (this._tableExists('module_js_findings')) {
@@ -449,6 +593,19 @@ class DatabaseLayer {
         JOIN module_js_findings mjf ON mjf.module_id = m.id
         JOIN findings f ON f.id = mjf.finding_id
         WHERE COALESCE(f.facets, '') <> ''
+      `)) tally(r.cid, r.facets, r.certain);
+    }
+
+    // Widget experiment findings (global-mx in bundled widget JS). Same isolated
+    // contract as the module experiments — keys (experiment-mx-global, …) are not
+    // in FACET_DEFS, so they never fold into the finalized facets.
+    if (this._tableExists('widget_experiment_findings')) {
+      for (const r of this.query(`
+        SELECT w.component_id AS cid, ef.facets AS facets, wef.certain AS certain
+        FROM widgets w
+        JOIN widget_experiment_findings wef ON wef.widget_id = w.id
+        JOIN experiment_findings ef ON ef.id = wef.finding_id
+        WHERE COALESCE(ef.facets, '') <> ''
       `)) tally(r.cid, r.facets, r.certain);
     }
 
@@ -742,13 +899,22 @@ class DatabaseLayer {
   // =============================================================================
 
   getComponentVersions(componentId) {
-    return this.query(`
+    const rows = this.query(`
       SELECT cv.id, cv.version_id, cv.version_number, cv.name,
              cv.min_supported_mendix_version, cv.publication_date
       FROM component_versions cv
       WHERE cv.component_id = ?
-      ORDER BY cv.publication_date DESC, cv.version_number DESC
     `, [componentId]);
+    // Sort by version NUMBER descending so versions[0] is the true latest. Ordering
+    // by publication_date is wrong: a republished older release (e.g. an old Mendix 10
+    // line patched for a library vulnerability) has the newest date but a lower number,
+    // which would otherwise steal the "latest" badge. Version number is stable and
+    // matches what the Marketplace surfaces as latest.
+    return rows.sort((a, b) => {
+      const cmp = this.compareVersions(b.version_number, a.version_number);
+      if (cmp !== 0) return cmp;
+      return (b.publication_date || '').localeCompare(a.publication_date || '');
+    });
   }
 
   // =============================================================================

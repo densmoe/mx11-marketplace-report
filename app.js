@@ -3,6 +3,14 @@
 let db = null;
 let dbLayer = null;
 
+// The component-detail Experiments tab is hidden by default. It appears only
+// when the URL carries the `showExperiments` param — which the Experiments-page
+// list rows attach, so the tab shows when you navigate in from there (or when
+// the param is added to the URL by hand).
+let _showExperiments = false;
+// Optional `selectedTab` URL param — preselects a component-detail tab on load.
+let _selectedTab = null;
+
 // =============================================================================
 // Routing
 // =============================================================================
@@ -33,12 +41,19 @@ function navigateTo(view, id, params) {
 
 function applyHash() {
   if (!dbLayer) return;
-  const { view, id } = parseHash();
+  const { view, id, params } = parseHash();
+  _showExperiments = params.showExperiments === '1' || params.showExperiments === 'true';
+  _selectedTab = params.selectedTab || null;
 
   document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
   const navKey = { component: 'components', widget: 'widgets', module: 'modules', issue: 'issues' }[view] || view;
   const link = document.querySelector(`[data-view="${navKey}"]`);
   if (link) link.classList.add('active');
+
+  // List views restore their filter state from URL params so a copied link
+  // reproduces the exact filtered view. Non-list views leave filters untouched.
+  const LIST_VIEWS = { components: 1, widgets: 1, modules: 1, 'starter-apps': 1, experiments: 1 };
+  if (LIST_VIEWS[view]) _applyCompFilterParams(params);
 
   switch (view) {
     case 'dashboard':     renderDashboard(); break;
@@ -49,10 +64,79 @@ function applyHash() {
     case 'modules':       renderComponentCategory('modules'); break;
     case 'module':        id ? renderModuleDetail(id) : renderComponentCategory('modules'); break;
     case 'starter-apps':  renderComponentCategory('starter-apps'); break;
+    case 'experiments':   renderComponentCategory('experiments'); break;
+    case 'teams':         renderTeams(); break;
     case 'issues':        renderIssues(); break;
     case 'issue':         id ? renderIssueDetail(id) : renderIssues(); break;
     default:              renderDashboard();
   }
+}
+
+// --- Shareable filter state <-> URL params -----------------------------------
+//
+// The Components (and category) views keep their filter state in the global
+// `componentFilters`. To make a filtered view shareable, that state is mirrored
+// into the URL hash query and restored on load. Encoding keeps links readable:
+// arrays are comma-joined; column filters use `key:v1|v2` groups joined by `;`.
+
+const _FILTER_PARAM_KEYS = ['q', 'pub', 'types', 'support', 'status', 'teams', 'deps', 'sort', 'cols'];
+
+function _compFiltersToParams() {
+  const p = {};
+  const f = componentFilters;
+  if ((f.search || '').trim())     p.q = f.search.trim();
+  if (f.publisher)                 p.pub = f.publisher;
+  if (f.contentTypes.length)       p.types = f.contentTypes.join(',');
+  if (f.supportTypes.length)       p.support = f.supportTypes.join(',');
+  if (f.statuses && f.statuses.length) p.status = f.statuses.join(',');
+  if (f.teams && f.teams.length)   p.teams = f.teams.join(',');
+  if (f.moduleDeps && f.moduleDeps.length) p.deps = f.moduleDeps.join(',');
+  if (f.sortBy)                    p.sort = `${f.sortBy}:${f.sortDir || 'desc'}`;
+  const cols = Object.entries(f.columnFilters).filter(([, v]) => v && v.length);
+  if (cols.length) p.cols = cols.map(([k, v]) => `${k}:${v.join('|')}`).join(';');
+  return p;
+}
+
+// Restore filter state from URL params. When no filter params are present, apply
+// the default Support selection (everything except Deprecated) as on a fresh load.
+function _applyCompFilterParams(params) {
+  const has = _FILTER_PARAM_KEYS.some(k => params[k] != null);
+  const f = componentFilters;
+  f.search        = params.q || '';
+  f.publisher     = params.pub || null;
+  f.contentTypes  = params.types   ? params.types.split(',')   : [];
+  f.statuses      = params.status  ? params.status.split(',')  : [];
+  f.teams         = params.teams   ? params.teams.split(',')   : [];
+  f.moduleDeps    = params.deps    ? params.deps.split(',')    : [];
+  if (params.support) {
+    f.supportTypes = params.support.split(',');
+  } else if (!has) {
+    _applySupportDefault();
+  } else {
+    f.supportTypes = [];
+  }
+  if (params.sort) {
+    const [by, dir] = params.sort.split(':');
+    f.sortBy = by || null; f.sortDir = dir === 'asc' ? 'asc' : 'desc';
+  } else {
+    f.sortBy = null; f.sortDir = 'desc';
+  }
+  f.columnFilters = {};
+  if (params.cols) {
+    for (const group of params.cols.split(';')) {
+      const [k, vals] = group.split(':');
+      if (k && vals) f.columnFilters[k] = vals.split('|');
+    }
+  }
+}
+
+// Mirror the current filter state into the URL without triggering a re-render.
+// Preserves the active view/id and any non-filter params (e.g. selectedTab).
+function _syncFiltersToURL() {
+  const { view, id, params } = parseHash();
+  for (const k of _FILTER_PARAM_KEYS) delete params[k];
+  Object.assign(params, _compFiltersToParams());
+  history.replaceState(null, '', '#' + buildHash({ view, id, params }));
 }
 
 function setupNav() {
@@ -72,6 +156,17 @@ function initApp() {
   _applySupportDefault();
   renderScanDate();
   setupNav();
+  // Reveal the Teams nav item only when the DB carries internal ownership data.
+  if (dbLayer.getDistinctTeams().length > 0) {
+    const navTeams = document.getElementById('nav-teams');
+    if (navTeams) navTeams.classList.remove('hidden');
+  }
+  // Reveal the Experiments nav item only when the DB carries experimental findings.
+  // The public (redacted) build empties those tables, so this stays hidden there.
+  if (dbLayer.hasExperimentData()) {
+    const navExp = document.getElementById('nav-experiments');
+    if (navExp) navExp.classList.remove('hidden');
+  }
   document.getElementById('loading-view').classList.replace('active', 'hidden');
   document.getElementById('dashboard-view').classList.replace('hidden', 'active');
   window.addEventListener('hashchange', applyHash);
@@ -297,11 +392,17 @@ function _modelVersions(c) {
 
 // Marketplace-vs-model version mismatch: any module built in a Mendix version that
 // differs from the marketplace-declared minimum. Returns the offending values, or null.
+// Compares only at the min_mx_version's precision: min_mx_version is 3-part ("10.24.8")
+// while a model version carries a 4th build component ("10.24.8.80126"), so a full
+// compare would flag every module. Truncate the model version to the same number of
+// components before comparing.
 function versionMismatch(c) {
   if (!c.min_mx_version) return null;
   const models = _modelVersions(c);
   if (!models.length) return null;
-  const diff = models.filter(mv => dbLayer.compareVersions(mv, c.min_mx_version) !== 0);
+  const prec = c.min_mx_version.split('.').length;
+  const atPrec = v => v.split('.').slice(0, prec).join('.');
+  const diff = models.filter(mv => dbLayer.compareVersions(atPrec(mv), c.min_mx_version) !== 0);
   return diff.length ? { marketplace: c.min_mx_version, models } : null;
 }
 
@@ -650,7 +751,7 @@ function statCard(label, value, sub, valueClass) {
 
 // columnFilters: { <columnFilterKey>: [<status>, ...] } — per badge-column status filter.
 // statuses: overall-status filter (breaking/warning/compatible), driven by the visible Status combobox.
-let componentFilters = { contentTypes: [], supportTypes: [], statuses: [], columnFilters: {}, search: '', publisher: null, sortBy: null, sortDir: 'desc', moduleDeps: [] };
+let componentFilters = { contentTypes: [], supportTypes: [], statuses: [], columnFilters: {}, search: '', publisher: null, sortBy: null, sortDir: 'desc', moduleDeps: [], teams: [] };
 let _searchDebounceTimer = null;
 let _openCombo = null;          // id of the filter/header-filter panel to keep open across re-renders
 let _supportDefaultApplied = false;
@@ -667,6 +768,22 @@ const FACET_DEFS = [
   { key: 'mx12',         label: 'Mx12+',        full: 'Mendix 12+ ready' },
 ];
 const FACET_BY_KEY = Object.fromEntries(FACET_DEFS.map(d => [d.key, d]));
+
+// Experimental facets — not-yet-finalized signals surfaced only on the Experiments
+// page. Kept OUT of FACET_DEFS so they never appear in the finalized facet columns,
+// dashboard summary cards, or the detail-page facet matrix. Their finding rows are
+// also excluded from every finalized rollup in db-layer.js.
+// `surface` controls applicability (when a component reads N/A for the facet):
+//   'module' — needs a Java module (the check can't apply without one)
+//   'js'     — needs JS to scan (widget JS or JS-action JS); applies to widget-only
+//              packages too, so it must NOT be gated on Java modules.
+const EXPERIMENT_FACET_DEFS = [
+  { key: 'experiment-javax', label: 'javax.*', full: 'Imports javax.servlet / javax.websocket (Java migration candidate)', surface: 'module' },
+  { key: 'experiment-mendixsso', label: 'MendixSSO', full: 'References the MendixSSO module (dependency or bundled module)', surface: 'module' },
+  { key: 'experiment-mx-global', label: 'mx.*', full: 'Uses the global `mx` client object (bare mx.data / mx.ui / …) — import-based client API migration candidate', surface: 'js' },
+  { key: 'experiment-window-mx-global', label: 'window.mx', full: 'Uses the global `mx` client object via window.mx — import-based client API migration candidate', surface: 'js' },
+];
+const EXPERIMENT_FACET_BY_KEY = Object.fromEntries(EXPERIMENT_FACET_DEFS.map(d => [d.key, d]));
 
 function _statusRank(s) { return s === 'breaking' ? 3 : s === 'warning' ? 2 : s === 'compatible' ? 1 : 0; }
 function _worseStatus(a, b) { return _statusRank(b) > _statusRank(a) ? b : a; }
@@ -736,6 +853,24 @@ function componentFacetStatus(c) {
     'mx12':         { status: mx12, ...dep },
     _moduleDeps:    data.moduleDeps || [],
   };
+
+  // Experimental facets — kept separate from the finalized ones above. A hit reads
+  // as a neutral "flagged" warning; otherwise compatible when the check can apply,
+  // else N/A. Applicability depends on the check's surface: 'module' checks need a
+  // Java module; 'js' checks need JS to scan (widgets always have JS; modules only
+  // if they ship js). These never feed the overall status / breaking counts.
+  const hasWidgets = (c.widget_count || 0) > 0;
+  const hasScannedJS = hasWidgets || (c.js_module_count || 0) > 0;
+  for (const d of EXPERIMENT_FACET_DEFS) {
+    const counts = cnt(d.key);
+    const applicable = d.surface === 'js' ? hasScannedJS : hasModules;
+    let status;
+    if (!applicable) status = 'na';
+    else if (counts.certain > 0 || counts.uncertain > 0) status = 'warning';
+    else status = 'compatible';
+    result[d.key] = { status, ...counts };
+  }
+
   _facetStatusCache[c.id] = result;
   return result;
 }
@@ -771,6 +906,20 @@ function _facetTooltip(def, fs) {
 function facetTd(ctx, key) {
   const def = FACET_BY_KEY[key];
   return facetBadge(ctx[key].status, _facetTooltip(def, ctx[key]));
+}
+
+// Badge cell for an experimental facet (Experiments page). Reuses the 4-state badge
+// but with a neutral, migration-oriented tooltip.
+function expFacetTd(ctx, key) {
+  const def = EXPERIMENT_FACET_BY_KEY[key];
+  const fs = ctx[key] || { status: 'na', certain: 0, uncertain: 0 };
+  let tip;
+  if (fs.status === 'na') tip = `${def.full}: not applicable`;
+  else if (fs.status === 'warning') {
+    const n = (fs.certain || 0) + (fs.uncertain || 0);
+    tip = `${def.full}: flagged in ${n} place${n !== 1 ? 's' : ''}`;
+  } else tip = `${def.full}: not found`;
+  return facetBadge(fs.status, tip);
 }
 
 // Detail-page facet box — fully colored background, icon top-left, label + detail.
@@ -1035,6 +1184,11 @@ const COLUMN_FILTER_OPTS = {
     { value: 'compatible', label: 'Dojo-free' },
     { value: 'breaking',   label: 'Has Dojo widgets' },
   ],
+  experiment: [
+    { value: 'warning',    label: 'Flagged' },
+    { value: 'compatible', label: 'Clear' },
+    { value: 'na',         label: 'N/A' },
+  ],
 };
 
 // Normalized status of a badge column for a component (4-state facet vocabulary).
@@ -1060,6 +1214,10 @@ const COMPONENT_COLUMNS = {
   facet_mx12:  { label: 'Mx12+', badge: true, filterKey: 'mx12', filterOpts: 'facet', render: (c, ctx) => facetTd(ctx, 'mx12') },
   facet_react: { label: 'React Client', badge: true, filterKey: 'react-client', filterOpts: 'facet', render: (c, ctx) => facetTd(ctx, 'react-client') },
   facet_newstring: { label: 'New String', badge: true, filterKey: 'new-string', filterOpts: 'facet', render: (c, ctx) => facetTd(ctx, 'new-string') },
+  exp_javax:   { label: 'javax.*', badge: true, filterKey: 'experiment-javax', filterOpts: 'experiment', render: (c, ctx) => expFacetTd(ctx, 'experiment-javax') },
+  exp_mendixsso: { label: 'MendixSSO', badge: true, filterKey: 'experiment-mendixsso', filterOpts: 'experiment', render: (c, ctx) => expFacetTd(ctx, 'experiment-mendixsso') },
+  exp_mxglobal: { label: 'mx.*', badge: true, filterKey: 'experiment-mx-global', filterOpts: 'experiment', render: (c, ctx) => expFacetTd(ctx, 'experiment-mx-global') },
+  exp_windowmx: { label: 'window.mx', badge: true, filterKey: 'experiment-window-mx-global', filterOpts: 'experiment', render: (c, ctx) => expFacetTd(ctx, 'experiment-window-mx-global') },
   dojofree:    { label: 'Dojo-free', badge: true, filterKey: 'dojofree', filterOpts: 'dojofree', render: (c, ctx) => dojoFreeCell(ctx) },
   managed:     { label: 'Managed deps', badge: true, filterKey: 'managed', filterOpts: 'managed', render: c => managedDepsCell(c) },
   moduledeps:  { label: 'Module deps', sortKey: 'moduledeps_count', render: (c, ctx) => moduleDepsCell(c, ctx) },
@@ -1085,6 +1243,9 @@ const VIEW_CONFIGS = {
   'starter-apps': { containerId: 'starter-apps-view', title: 'Starter Apps', noun: 'starter app', contentType: 'Starter App', showTypeFilter: false,
     blurb: 'Full starter/example apps from the Marketplace. Dojo-free flags whether an app still ships any Dojo-based widgets, which are incompatible with the Mendix 11 React client.',
     columns: ['name', 'support', 'minmx', 'facet_mx10', 'facet_mx11', 'facet_mx12', 'facet_react', 'facet_newstring', 'dojofree', 'downloads', 'updated'] },
+  'experiments':  { containerId: 'experiments-view', title: 'Experiments', noun: 'Marketplace package', contentType: null, showTypeFilter: true,
+    blurb: 'Experimental, not-yet-finalized checks — a preview surface for signals we are still validating, kept separate from the finalized compatibility facets. Currently: which packages import javax.servlet / javax.websocket (flagged for the Runtime Core Java API migration); which reference the MendixSSO module (a dependency on it or a package that bundles it); and which use the global `mx` client object — bare mx.* or via window.mx — flagged for the future import-based client API migration. These are heads-ups, not Mendix 11 breaks. Click a row for details.',
+    columns: ['name', 'type', 'support', 'minmx', 'exp_javax', 'exp_mendixsso', 'exp_mxglobal', 'exp_windowmx', 'downloads', 'updated'] },
 };
 
 // Whether the loaded dataset carries any production-usage figures. The public
@@ -1108,6 +1269,8 @@ function _effectiveColumns(cfg) {
 
 function _buildListRows(components, cfg) {
   const columns = _effectiveColumns(cfg);
+  // Rows on the Experiments page carry showExperiments so the detail-page
+  // Experiments tab is visible when you drill in from here.
   return components.map(c => {
     const ctx = componentFacetStatus(c);
     const cells = columns.map(key => {
@@ -1115,7 +1278,10 @@ function _buildListRows(components, cfg) {
       const cls = col.badge ? 'px-1 py-3 text-center w-16' : 'px-4 py-3';
       return `<td class="${cls}">${col.render(c, ctx)}</td>`;
     }).join('');
-    return `<tr class="hover:bg-dark-hover cursor-pointer transition-colors" onclick="navigateTo('component','${c.marketplace_id}')">${cells}</tr>`;
+    const onclick = _currentListView === 'experiments'
+      ? `navigateTo('component','${c.marketplace_id}',{showExperiments:'1',selectedTab:'experiments'})`
+      : `navigateTo('component','${c.marketplace_id}')`;
+    return `<tr class="hover:bg-dark-hover cursor-pointer transition-colors" onclick="${onclick}">${cells}</tr>`;
   }).join('');
 }
 
@@ -1162,7 +1328,7 @@ let _currentListView = 'components';
 
 function renderComponents()            { renderComponentList('components'); }
 function renderComponentCategory(view) { renderComponentList(view); }
-function _rerenderList()               { renderComponentList(_currentListView); }
+function _rerenderList()               { _syncFiltersToURL(); renderComponentList(_currentListView); }
 
 // Shared filtering + sorting pipeline used by every component list view.
 // All filtering is done in JS over the cached unfiltered getComponents() result.
@@ -1178,6 +1344,8 @@ function _filteredComponents(cfg) {
   const q = (componentFilters.search || '').trim().toLowerCase();
   if (q) components = components.filter(c => (c.name || '').toLowerCase().includes(q));
   if (componentFilters.publisher) components = components.filter(c => c.publisher === componentFilters.publisher);
+  if (componentFilters.teams && componentFilters.teams.length)
+    components = components.filter(c => componentFilters.teams.includes(c.owning_team));
   const cfm = componentFilters.columnFilters;
   const activeCols = Object.keys(cfm).filter(k => cfm[k] && cfm[k].length);
   if (activeCols.length) {
@@ -1192,11 +1360,22 @@ function _filteredComponents(cfg) {
   }
   if (componentFilters.sortBy) {
     const key = componentFilters.sortBy, dir = componentFilters.sortDir === 'asc' ? 1 : -1;
+    // Columns whose values are dotted version strings — must sort numerically per
+    // component, not lexicographically (else "10.x" sorts before "9.x").
+    const VERSION_KEYS = { min_mx_version: 1 };
     components = [...components].sort((a, b) => {
       if (key === 'moduledeps_count') {
         const ad = ((componentFacetStatus(a)._moduleDeps) || []).length;
         const bd = ((componentFacetStatus(b)._moduleDeps) || []).length;
         return dir * (ad - bd);
+      }
+      if (VERSION_KEYS[key]) {
+        // Empty versions sort last regardless of direction.
+        const av = a[key] || '', bv = b[key] || '';
+        if (!av && !bv) return 0;
+        if (!av) return 1;
+        if (!bv) return -1;
+        return dir * dbLayer.compareVersions(av, bv);
       }
       const av = a[key] ?? 0, bv = b[key] ?? 0;
       if (typeof av === 'number') return dir * (av - bv);
@@ -1211,7 +1390,8 @@ function _anyCompFilter() {
   return !!componentFilters.publisher || !!(componentFilters.search || '').trim()
     || componentFilters.contentTypes.length > 0 || componentFilters.supportTypes.length > 0
     || (componentFilters.statuses && componentFilters.statuses.length > 0)
-    || (componentFilters.moduleDeps && componentFilters.moduleDeps.length > 0) || cols;
+    || (componentFilters.moduleDeps && componentFilters.moduleDeps.length > 0)
+    || (componentFilters.teams && componentFilters.teams.length > 0) || cols;
 }
 
 function _clearAllBtn() {
@@ -1263,6 +1443,7 @@ function _toggleArr(key, value) {
 function toggleTypeFilter(v)    { _openCombo = 'combo-type';    _toggleArr('contentTypes', v); }
 function toggleSupportFilter(v) { _openCombo = 'combo-support'; _toggleArr('supportTypes', v); }
 function toggleStatusFilter(v)  { _openCombo = 'combo-status';  _toggleArr('statuses', v); }
+function toggleTeamFilter(v)    { _openCombo = 'combo-team';    _toggleArr('teams', v); }
 
 // Per-column header status filter.
 function toggleColumnFilter(key, value) {
@@ -1384,6 +1565,13 @@ function renderComponentList(view) {
     ],
     selected: componentFilters.statuses, onToggle: 'toggleStatusFilter',
   });
+  // Owning-team filter — only shown when the DB carries internal ownership.
+  const teamNames = dbLayer.getDistinctTeams().map(r => r.team).filter(Boolean);
+  const teamCombo = teamNames.length ? _comboFilter({
+    id: 'combo-team', allLabel: 'All teams', selLabel: 'Teams',
+    items: teamNames.map(t => ({ value: t, label: t })),
+    selected: componentFilters.teams, onToggle: 'toggleTeamFilter',
+  }) : '';
   let moduleDepCombo = '';
   if (view === 'modules') {
     const allDeps = new Set();
@@ -1411,6 +1599,7 @@ function renderComponentList(view) {
       ${typeCombo}
       ${supportCombo}
       ${statusCombo}
+      ${teamCombo}
       ${moduleDepCombo}
       <span class="text-xs text-gray-600 ml-1">Tip: click a column header (Mx11, React Client…) to filter by that column</span>
       <span id="comp-clear-wrap" class="ml-auto">${_clearAllBtn()}</span>
@@ -1468,7 +1657,7 @@ function setComponentFilter(key, value) {
   componentFilters[key] = value;
   if (key === 'search' && document.getElementById('comp-tbody')) {
     clearTimeout(_searchDebounceTimer);
-    _searchDebounceTimer = setTimeout(_refreshComponentResults, 150);
+    _searchDebounceTimer = setTimeout(() => { _syncFiltersToURL(); _refreshComponentResults(); }, 150);
   } else {
     _rerenderList();
   }
@@ -1520,6 +1709,7 @@ function clearCompFilters() {
   componentFilters.statuses      = [];
   componentFilters.columnFilters = {};
   componentFilters.moduleDeps    = [];
+  componentFilters.teams         = [];
   _applySupportDefault();
   _openCombo = null;
   _rerenderList();
@@ -1626,6 +1816,12 @@ const _TAB_OFF = 'px-5 py-2.5 text-sm font-medium text-gray-400 border-b-2 borde
 
 function setComponentDetailTab(tab) {
   _compDetailTab = tab;
+  _selectedTab = tab;
+  // Reflect the open tab in the URL (selectedTab param) without re-rendering,
+  // preserving the current view/id and any other params (e.g. showExperiments).
+  const { view, id, params } = parseHash();
+  params.selectedTab = tab;
+  history.replaceState(null, '', '#' + buildHash({ view, id, params }));
   document.querySelectorAll('[data-comp-tab]').forEach(btn => {
     btn.className = btn.dataset.compTab === tab ? _TAB_ON : _TAB_OFF;
   });
@@ -1637,10 +1833,13 @@ function renderComponentDetail(marketplaceId) {
   const comp = dbLayer.getComponentDetail(marketplaceId);
   if (!comp) { renderComponents(); return; }
 
-  // Reset tab when navigating to a different component
+  // Reset tab when navigating to a different component. A `selectedTab` URL
+  // param (e.g. from an Experiments-page row) preselects that tab instead.
   if (_compDetailId !== marketplaceId) {
     _compDetailId  = marketplaceId;
-    _compDetailTab = 'details';
+    _compDetailTab = _selectedTab || 'details';
+  } else if (_selectedTab) {
+    _compDetailTab = _selectedTab;
   }
 
   // Sub-queries use the internal DB id, not the marketplace_id from the URL.
@@ -1648,6 +1847,11 @@ function renderComponentDetail(marketplaceId) {
   const widgets  = dbLayer.getComponentWidgets(internalId);
   const modules  = dbLayer.getComponentModules(internalId);
   const versions = dbLayer.getComponentVersions(internalId);
+
+  // Experimental findings (Java javax/MendixSSO + global-mx on widgets/JS actions)
+  // only surface when navigated in with showExperiments. Loaded here so both the
+  // widget-only and complex branches can render the Experiments tab.
+  const expFindings = _showExperiments ? dbLayer.getExperimentalFindings(internalId) : [];
 
   const backLink = `
     <div class="mb-4">
@@ -1667,12 +1871,22 @@ function renderComponentDetail(marketplaceId) {
 
   let body;
   if (modules.length === 0) {
-    // Pure widget component — Details + Widgets (if any) + Version History.
+    // Pure widget component — Details + Widgets (if any) + Version History,
+    // plus Experiments (global-mx) when navigated in with showExperiments.
     const tabs = [
       { key: 'details',  label: 'Overview' },
       ...(widgets.length > 0 ? [{ key: 'widgets', label: `Widgets (${widgets.length})` }] : []),
       { key: 'versions', label: versionsLabel },
+      ...(expFindings.length > 0 ? [{ key: 'experiments', label: `Experiments (${expFindings.length})` }] : []),
     ];
+
+    // Widget-package experiments carry inline snippets (minified widget JS, no full
+    // source stored), so no side source viewer is used here — but keep the shared
+    // source maps defined so the viewer helpers stay safe if ever called.
+    _javaSources = {};
+    _jsSources = {};
+    _jsFindingLines = {};
+    _javaFindingLines = {};
 
     // Guard: reset to 'details' if saved tab is no longer valid
     if (!tabs.find(t => t.key === _compDetailTab)) _compDetailTab = 'details';
@@ -1693,7 +1907,11 @@ function renderComponentDetail(marketplaceId) {
       </div>
       <div data-comp-panel="versions" class="${_compDetailTab !== 'versions' ? 'hidden' : ''}">
         ${buildVersionHistoryPanel(versions)}
-      </div>`;
+      </div>
+      ${expFindings.length > 0 ? `
+      <div data-comp-panel="experiments" class="${_compDetailTab !== 'experiments' ? 'hidden' : ''}">
+        ${buildExperimentsPanel(modules, expFindings)}
+      </div>` : ''}`;
   } else {
     // Complex component (module/starter/solution…) — tabbed view
     const javaFindings   = dbLayer.getComponentJavaFindings(internalId);
@@ -1701,18 +1919,38 @@ function renderComponentDetail(marketplaceId) {
     const bundledWidgets = widgets.filter(w => w.bundled_in_module);
 
     // Load Java source (only files with findings) and index which lines have
-    // findings, so the source viewer can highlight them on click.
+    // findings, so the source viewer can highlight them on click. Java experiment
+    // findings (javax/MendixSSO — module surface, empty snippet) share the same
+    // module_java_sources snippets and source viewer; global-mx experiments carry
+    // their own inline snippets and are not indexed here.
     _javaSources = dbLayer.getComponentJavaSources(internalId);
     _javaFindingLines = {};
+    const javaExpFindings = expFindings.filter(f => (f.surface || 'module') === 'module');
     for (const f of javaFindings) {
       for (const loc of parseLocs(f.locations)) {
         const key = f.module_id + '\x1f' + loc.path;
         (_javaFindingLines[key] || (_javaFindingLines[key] = new Set())).add(parseInt(loc.line, 10));
       }
     }
-    // Same for JavaScript-action source.
+    for (const f of javaExpFindings) {
+      for (const loc of parseExpLocs(f.locations)) {
+        const key = f.unit_id + '\x1f' + loc.path;
+        (_javaFindingLines[key] || (_javaFindingLines[key] = new Set())).add(parseInt(loc.line, 10));
+      }
+    }
+    // Same for JavaScript-action source — including files referenced only by a
+    // JS-action experiment finding (global-mx), whose source we now also persist so
+    // the Experiments drill-down opens the same side source viewer as JS Actions.
     _jsSources = dbLayer.getComponentJSSources(internalId);
     _jsFindingLines = {};
+    const jsExpFindings = expFindings.filter(f =>
+      (f.surface || 'module') === 'module' && String(f.category || '').includes('mx-global'));
+    for (const f of jsExpFindings) {
+      for (const loc of parseExpLocs(f.locations)) {
+        const key = f.unit_id + '\x1f' + loc.path;
+        (_jsFindingLines[key] || (_jsFindingLines[key] = new Set())).add(parseInt(loc.line, 10));
+      }
+    }
     for (const f of jsFindings) {
       for (const loc of parseLocs(f.locations)) {
         const key = f.module_id + '\x1f' + loc.path;
@@ -1727,6 +1965,8 @@ function renderComponentDetail(marketplaceId) {
       ...(jsFindings.length > 0 ? [{ key: 'jsactions', label: `JS Actions (${jsFindings.length})` }] : []),
       ...(bundledWidgets.length > 0 ? [{ key: 'widgets', label: `Widgets (${bundledWidgets.length})` }] : []),
       { key: 'versions',  label: versionsLabel },
+      // Experiments is the last tab, and only present when navigated in with showExperiments.
+      ...(expFindings.length > 0 ? [{ key: 'experiments', label: `Experiments (${expFindings.length})` }] : []),
     ];
 
     if (!tabs.find(t => t.key === _compDetailTab)) _compDetailTab = 'details';
@@ -1758,7 +1998,11 @@ function renderComponentDetail(marketplaceId) {
       </div>` : ''}
       <div data-comp-panel="versions" class="${_compDetailTab !== 'versions' ? 'hidden' : ''}">
         ${buildVersionHistoryPanel(versions)}
-      </div>`;
+      </div>
+      ${expFindings.length > 0 ? `
+      <div data-comp-panel="experiments" class="${_compDetailTab !== 'experiments' ? 'hidden' : ''}">
+        ${buildExperimentsPanel(modules, expFindings)}
+      </div>` : ''}`;
   }
 
   document.getElementById('component-detail-view').innerHTML = `
@@ -2007,6 +2251,37 @@ function buildAboutCard(comp) {
 // ---------------------------------------------------------------------------
 // Component detail — Overview tab (compat + health + about + details sidebar)
 // ---------------------------------------------------------------------------
+// Sidebar card showing which internal Mendix team owns this component, sourced
+// from the Content Ownership app. Returns '' when the component has no owning team
+// (community/partner content, or an older DB without ownership data). Links the
+// team name to the Teams page and offers Jira/Slack shortcuts.
+function buildOwnershipCard(comp) {
+  if (!comp.owning_team) return '';
+  const teamLink = `<a href="#${buildHash({ view: 'components', params: { teams: comp.owning_team } })}"
+      class="text-mx-blue hover:text-mx-blue/80 font-medium">${esc(comp.owning_team)}</a>`;
+  const hierarchy = [comp.owning_group, comp.owning_unit].filter(Boolean).map(esc).join(' › ');
+  const jira = comp.owning_jira
+    ? extLinkPill(`https://jira.mendix.com/projects/${encodeURIComponent(comp.owning_jira)}`, `Jira: ${comp.owning_jira}`)
+    : '';
+  const slack = (comp.owning_slack_channel || comp.owning_slack_url)
+    ? extLinkPill(comp.owning_slack_url || '#', comp.owning_slack_channel || 'Slack')
+    : '';
+  const rows = [
+    metaItem('Team', teamLink),
+    metaItem('Group / Unit', hierarchy),
+  ].filter(Boolean).join('');
+  const links = [jira, slack].filter(Boolean).join(' ');
+  return card(`
+    <div class="p-4">
+      <h3 class="text-xs font-semibold uppercase tracking-wide text-gray-400 mb-3 flex items-center gap-1.5">
+        <svg class="w-3.5 h-3.5 text-mx-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-1.13a4 4 0 10-4-4 4 4 0 004 4zm6 0a3 3 0 10-2.4-4.8"/></svg>
+        Internal Ownership
+      </h3>
+      <dl class="space-y-2.5">${rows}</dl>
+      ${links ? `<div class="mt-3 flex flex-wrap gap-2">${links}</div>` : ''}
+    </div>`);
+}
+
 function buildDetailsPanel(comp, modules, allWidgets, compatHtml) {
   const devs = parseDevelopers(comp.developers_json);
   const devHtml = devs.length ? `<div class="flex flex-wrap gap-1.5">${devs.map(d => {
@@ -2071,7 +2346,9 @@ function buildDetailsPanel(comp, modules, allWidgets, compatHtml) {
       <dl class="space-y-2.5">${rows || '<p class="text-sm text-gray-500">No metadata available.</p>'}</dl>
     </div>`);
 
-  const sidebarContent = `${structSummary ? `${structSummary}<div class="mt-3">${metaCard}</div>` : metaCard}`;
+  const ownershipCard = buildOwnershipCard(comp);
+  const sidebarTop = ownershipCard ? `${ownershipCard}<div class="mt-3">${metaCard}</div>` : metaCard;
+  const sidebarContent = `${structSummary ? `${structSummary}<div class="mt-3">${sidebarTop}</div>` : sidebarTop}`;
 
   return `
     <div class="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-4 items-start">
@@ -2686,13 +2963,120 @@ function buildJavaIssuesPanel(modules, javaFindings) {
     </div>`;
 }
 
+// Experiments panel for the component detail page — the drill-down for experimental /
+// future-migration findings (e.g. javax.servlet/websocket imports). Mirrors
+// buildJavaIssuesPanel (findings left, clickable source viewer right) but uses its
+// own DOM ids so it doesn't clash with the Java Issues panel, and frames the findings
+// as neutral migration heads-ups rather than breaks.
+function buildExperimentsPanel(modules, expFindings) {
+  if (expFindings.length === 0) {
+    return `<div class="text-center py-10">
+      <p class="text-sm text-gray-500">No experimental findings for this component.</p>
+    </div>`;
+  }
+
+  // Fresh per-file widget snippet store for this component (populated as we render
+  // widget findings below, read back by showWidgetExpMatches on click).
+  _widgetExpMatches = {};
+
+  // Group by unit (a module or a widget). surface distinguishes the two so we can
+  // label widget-JS findings and route the Java source viewer only for modules.
+  const unitKey = f => (f.surface || 'module') + ':' + f.unit_id;
+  const multiUnit = new Set(expFindings.map(unitKey)).size > 1;
+
+  function byUnit(findings) {
+    const map = {};
+    for (const f of findings) {
+      const k = unitKey(f);
+      if (!map[k]) map[k] = { surface: f.surface || 'module', name: f.unit_name, version: f.unit_version, findings: [] };
+      map[k].findings.push(f);
+    }
+    return Object.values(map);
+  }
+
+  // Location rendering — all three surfaces show a clickable file tree that opens
+  // the matches for that file in the side column:
+  //   • widget global-mx  → sidebar lists the captured snippets per file, matched
+  //                          token highlighted (minified widget JS — no full source)
+  //   • module global-mx  → sidebar shows the full JS-action source (stored), line
+  //                          highlighted (action files are short & un-minified)
+  //   • module javax/SSO   → sidebar shows the full Java source, line highlighted
+  function renderLocations(f) {
+    const surface = f.surface || 'module';
+    const isMxGlobal = String(f.category || '').includes('mx-global');
+    const locs = parseExpLocs(f.locations);
+    if (!locs.length) return '';
+
+    let tree;
+    if (surface === 'widget') {
+      // Register the per-file snippet matches for the sidebar, then a snippet-backed
+      // clickable tree (no full source — showWidgetExpMatches renders the snippets).
+      registerWidgetExpMatches(f.unit_id, locs, f.rule);
+      tree = buildWidgetExpLocationTree(locs, f.unit_id);
+    } else if (isMxGlobal) {
+      tree = buildJSLocationTree(locs.map(l => ({ path: l.path, line: l.line })),
+                                 f.unit_id, 'exp-source-col', 'exp-findings-col');
+    } else {
+      tree = buildLocationTree(locs.map(l => ({ path: l.path, line: l.line })),
+                               f.unit_id, 'exp-source-col', 'exp-findings-col');
+    }
+    return `
+      <div class="px-4 py-3 border-t border-amber-500/20 bg-dark-bg/60">
+        <div class="text-xs text-gray-600 uppercase tracking-wider mb-2">Source locations</div>
+        ${tree}
+      </div>`;
+  }
+
+  function renderFinding(f) {
+    return `
+      <div class="rounded-lg border border-amber-500/20 overflow-hidden">
+        <div class="px-4 py-3 bg-amber-500/5 flex items-start justify-between gap-4">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2 mb-1.5 flex-wrap">
+              <span class="inline-block px-2 py-0.5 bg-amber-500/10 text-amber-400 border-amber-500/20 text-xs rounded border font-medium">${esc(f.rule)}</span>
+              <span class="text-xs text-amber-400">experimental</span>
+            </div>
+            <p class="text-xs text-gray-300 leading-relaxed">${esc(f.description)}</p>
+            ${f.doc_url ? `<a href="${esc(f.doc_url)}" target="_blank" onclick="event.stopPropagation()"
+               class="text-xs text-mx-blue hover:underline mt-1 inline-block">Documentation →</a>` : ''}
+          </div>
+          <div class="text-right flex-shrink-0 pt-0.5">
+            <div class="text-sm font-semibold text-amber-400">${f.match_count || 0}</div>
+            <div class="text-xs text-gray-600">matches</div>
+          </div>
+        </div>
+        ${renderLocations(f)}
+      </div>`;
+  }
+
+  const groups = byUnit(expFindings);
+  const sections = `
+    <div class="mb-4 text-xs text-gray-500 leading-relaxed">
+      Experimental, not-yet-finalized signals — heads-ups for upcoming migrations, not Mendix 11 breaks.
+      They are excluded from this component's compatibility status and issue counts.
+    </div>
+    <div class="space-y-3">
+      ${groups.map(u => `
+        ${multiUnit ? `<div class="text-xs font-mono text-gray-500 mb-1">${u.surface === 'widget' ? '🧩 ' : ''}${esc(u.name)}${u.version ? ' v' + esc(u.version) : ''}</div>` : ''}
+        ${u.findings.map(renderFinding).join('')}`).join('')}
+    </div>`;
+
+  return `
+    <div id="exp-issues-split" class="flex gap-4 items-start">
+      <div id="exp-findings-col" class="flex-1 min-w-0">${sections}</div>
+      <div id="exp-source-col" class="hidden w-1/2 flex-shrink-0 sticky top-4"></div>
+    </div>`;
+}
+
 // Open the Java source viewer for a finding location in the right-hand column.
 // Highlights every line in that file that has a finding and scrolls to `line`.
-function showJavaSource(moduleId, filePath, line) {
+// colId/splitId let the same viewer serve multiple panels (Java + Experiments)
+// without duplicate DOM ids clashing.
+function showJavaSource(moduleId, filePath, line, colId = 'java-source-col', splitId = 'java-findings-col') {
   const key = moduleId + '\x1f' + filePath;
   const src = _javaSources[key];
-  const col = document.getElementById('java-source-col');
-  const split = document.getElementById('java-findings-col');
+  const col = document.getElementById(colId);
+  const split = document.getElementById(splitId);
   if (!col) return;
 
   if (src == null) {
@@ -2729,7 +3113,7 @@ function showJavaSource(moduleId, filePath, line) {
     <div class="rounded-lg border border-dark-border bg-dark-surface overflow-hidden">
       <div class="flex items-center justify-between px-4 py-2 border-b border-dark-border bg-dark-bg/60">
         <span class="text-xs font-mono text-gray-300 truncate" title="${esc(filePath)}">${esc(fileName)}</span>
-        <button onclick="closeJavaSource()" class="text-gray-500 hover:text-gray-200 text-lg leading-none px-1">&times;</button>
+        <button onclick="closeJavaSource('${colId}','${splitId}')" class="text-gray-500 hover:text-gray-200 text-lg leading-none px-1">&times;</button>
       </div>
       <div class="code-viewer overflow-auto" style="max-height:calc(100vh - 8rem)">${rows}</div>
     </div>`;
@@ -2738,9 +3122,9 @@ function showJavaSource(moduleId, filePath, line) {
   if (target) target.scrollIntoView({ block: 'center' });
 }
 
-function closeJavaSource() {
-  const col = document.getElementById('java-source-col');
-  const split = document.getElementById('java-findings-col');
+function closeJavaSource(colId = 'java-source-col', splitId = 'java-findings-col') {
+  const col = document.getElementById(colId);
+  const split = document.getElementById(splitId);
   if (col) { col.classList.add('hidden'); col.innerHTML = ''; }
   if (split) { split.classList.remove('w-1/2'); split.classList.add('flex-1'); }
 }
@@ -2838,11 +3222,12 @@ function buildJSActionsPanel(jsFindings) {
 }
 
 // Open the JS-action source viewer in the right-hand column (mirror of showJavaSource).
-function showJSSource(moduleId, filePath, line) {
+// colId/splitId let the same viewer serve multiple panels (JS Actions + Experiments).
+function showJSSource(moduleId, filePath, line, colId = 'js-source-col', splitId = 'js-findings-col') {
   const key = moduleId + '\x1f' + filePath;
   const src = _jsSources[key];
-  const col = document.getElementById('js-source-col');
-  const split = document.getElementById('js-findings-col');
+  const col = document.getElementById(colId);
+  const split = document.getElementById(splitId);
   if (!col) return;
 
   if (src == null) {
@@ -2875,7 +3260,7 @@ function showJSSource(moduleId, filePath, line) {
     <div class="rounded-lg border border-dark-border bg-dark-surface overflow-hidden">
       <div class="flex items-center justify-between px-4 py-2 border-b border-dark-border bg-dark-bg/60">
         <span class="text-xs font-mono text-gray-300 truncate" title="${esc(filePath)}">${esc(fileName)}</span>
-        <button onclick="closeJSSource()" class="text-gray-500 hover:text-gray-200 text-lg leading-none px-1">&times;</button>
+        <button onclick="closeJSSource('${colId}','${splitId}')" class="text-gray-500 hover:text-gray-200 text-lg leading-none px-1">&times;</button>
       </div>
       <div class="code-viewer overflow-auto" style="max-height:calc(100vh - 8rem)">${rows}</div>
     </div>`;
@@ -2884,40 +3269,91 @@ function showJSSource(moduleId, filePath, line) {
   if (target) target.scrollIntoView({ block: 'center' });
 }
 
-function closeJSSource() {
-  const col = document.getElementById('js-source-col');
-  const split = document.getElementById('js-findings-col');
+function closeJSSource(colId = 'js-source-col', splitId = 'js-findings-col') {
+  const col = document.getElementById(colId);
+  const split = document.getElementById(splitId);
   if (col) { col.classList.add('hidden'); col.innerHTML = ''; }
   if (split) { split.classList.remove('w-1/2'); split.classList.add('flex-1'); }
 }
 
-// Directory-grouped {path,line} tree for JS actions (mirror of buildLocationTree),
-// linking to showJSSource when the file's source is available.
-function buildJSLocationTree(locs, moduleId) {
-  if (!locs.length) return '';
-  const dirs = {};
-  for (const loc of locs) {
-    const slash = loc.path.lastIndexOf('/');
-    const dir  = slash >= 0 ? loc.path.slice(0, slash) : '';
-    const file = slash >= 0 ? loc.path.slice(slash + 1) : loc.path;
-    (dirs[dir] || (dirs[dir] = [])).push({ file, line: loc.line, path: loc.path });
+// -- Widget experiment matches (minified widget JS — snippets, not full source) --
+//
+// We never store minified widget source, so the Experiments sidebar for a widget
+// shows the captured per-line snippets for the clicked file, with the matched
+// global-mx token highlighted. Matches are registered per (widgetId, filePath)
+// while the panel renders, then read back by showWidgetExpMatches on click.
+let _widgetExpMatches = {}; // "widgetId\x1ffilePath" -> [{ line, snippet, rule }]
+
+function registerWidgetExpMatches(widgetId, locs, rule) {
+  for (const l of locs) {
+    const key = widgetId + '\x1f' + l.path;
+    (_widgetExpMatches[key] || (_widgetExpMatches[key] = [])).push({
+      line: l.line, snippet: l.snippet || '', rule,
+    });
   }
-  const hasSource = f => moduleId != null && _jsSources[moduleId + '\x1f' + f.path] != null;
-  return `<div class="font-mono text-xs space-y-0.5">
-    ${Object.entries(dirs).sort(([a],[b]) => a.localeCompare(b)).map(([dir, files]) => `
-      ${dir ? `<div class="text-gray-500 mt-1.5 first:mt-0">${esc(dir)}/</div>` : ''}
-      ${files.map((f, i) => {
-        const clickable = hasSource(f);
-        const inner = `<span class="${clickable ? 'text-mx-blue group-hover:underline' : 'text-gray-300'}">${esc(f.file)}</span>${f.line ? `<span class="${clickable ? 'text-mx-blue/70' : 'text-gray-600'}">:${f.line}</span>` : ''}`;
-        return `
-        <div class="flex items-baseline gap-2 ${dir ? 'pl-4' : ''}">
-          <span class="text-gray-700 select-none">${i === files.length - 1 ? '└' : '├'}</span>
-          ${clickable
-            ? `<a class="group cursor-pointer" onclick="showJSSource(${moduleId}, ${jsStr(f.path)}, ${parseInt(f.line, 10) || 0})">${inner}</a>`
-            : inner}
-        </div>`;
-      }).join('')}`).join('')}
-  </div>`;
+}
+
+// Clickable file tree for widget experiment matches. Widget JS is minified, so
+// clicking opens the captured snippets for that file in the side column (we never
+// store the full minified source). One row per file with a (N) count, like the rest.
+function buildWidgetExpLocationTree(locs, widgetId) {
+  return buildFileTree(locs, {
+    hasSource: () => true, // always openable — we have the snippets
+    onClick: path => `showWidgetExpMatches(${widgetId}, ${jsStr(path)})`,
+  });
+}
+
+// Highlight the global-mx token (window.mx.x or mx.x) inside an escaped snippet.
+function highlightMxToken(escapedSnippet) {
+  return escapedSnippet.replace(/\b(window\.mx\.[A-Za-z_$][\w$]*|mx\.[A-Za-z_$][\w$]*)/g,
+    '<span class="bg-amber-500/25 text-amber-200 rounded px-0.5">$1</span>');
+}
+
+// Open the widget experiment matches for a file in the exp side column.
+function showWidgetExpMatches(widgetId, filePath) {
+  const col = document.getElementById('exp-source-col');
+  const split = document.getElementById('exp-findings-col');
+  if (!col) return;
+  const matches = _widgetExpMatches[widgetId + '\x1f' + filePath] || [];
+  const fileName = filePath.includes('/') ? filePath.slice(filePath.lastIndexOf('/') + 1) : filePath;
+
+  // Minified widget JS puts every match on one line, and the ±60-char windows often
+  // repeat verbatim — dedupe identical snippets and show how many times each occurs.
+  const bySnippet = new Map();
+  for (const m of matches) {
+    const s = (m.snippet || '').trim();
+    bySnippet.set(s, (bySnippet.get(s) || 0) + 1);
+  }
+  const uniq = [...bySnippet.entries()];
+
+  const rows = uniq.length
+    ? uniq.map(([snip, n]) => `
+        <div class="px-3 py-2 border-b border-dark-border last:border-0">
+          ${n > 1 ? `<div class="text-xs text-gray-500 mb-1">×${n}</div>` : ''}
+          <pre class="text-xs text-gray-300 whitespace-pre-wrap break-all">${snip ? highlightMxToken(esc(snip)) : '<span class="text-gray-600">(no snippet)</span>'}</pre>
+        </div>`).join('')
+    : `<div class="p-4 text-xs text-gray-500">No snippet captured.</div>`;
+
+  col.classList.remove('hidden');
+  if (split) split.classList.remove('flex-1'), split.classList.add('w-1/2');
+  col.innerHTML = `
+    <div class="rounded-lg border border-dark-border bg-dark-surface overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-2 border-b border-dark-border bg-dark-bg/60">
+        <span class="text-xs font-mono text-gray-300 truncate" title="${esc(filePath)}">${esc(fileName)} · ${uniq.length} unique · ${matches.length} match${matches.length !== 1 ? 'es' : ''}</span>
+        <button onclick="closeJSSource('exp-source-col','exp-findings-col')" class="text-gray-500 hover:text-gray-200 text-lg leading-none px-1">&times;</button>
+      </div>
+      <div class="overflow-auto" style="max-height:calc(100vh - 8rem)">${rows}</div>
+    </div>`;
+}
+
+// Directory-grouped tree for JS actions (mirror of buildLocationTree), linking to
+// showJSSource when the file's source is available. colId/splitId let the same tree
+// target either the JS Actions viewer or the Experiments viewer.
+function buildJSLocationTree(locs, moduleId, colId = 'js-source-col', splitId = 'js-findings-col') {
+  return buildFileTree(locs, {
+    hasSource: path => moduleId != null && _jsSources[moduleId + '\x1f' + path] != null,
+    onClick: (path, line) => `showJSSource(${moduleId}, ${jsStr(path)}, ${line}, '${colId}', '${splitId}')`,
+  });
 }
 
 // Parse the locations blob from getComponentJavaFindings into [{path, line}]
@@ -2929,30 +3365,61 @@ function parseLocs(raw) {
   });
 }
 
-// Render a list of {path, line} as a directory-grouped tree. When moduleId is
-// given and source is available, each location is a clickable link that opens
-// the source viewer (showJavaSource) scrolled to that line.
-function buildLocationTree(locs, moduleId) {
-  if (!locs.length) return '';
+// Parse experiment locations packed as path~line~snippet (snippet may be empty
+// and may itself contain '~', so split on the first two separators only).
+function parseExpLocs(raw) {
+  if (!raw) return [];
+  return raw.split('\x1e').filter(Boolean).map(l => {
+    const i1 = l.indexOf('~');
+    if (i1 < 0) return { path: l, line: '', snippet: '' };
+    const i2 = l.indexOf('~', i1 + 1);
+    if (i2 < 0) return { path: l.slice(0, i1), line: l.slice(i1 + 1), snippet: '' };
+    return { path: l.slice(0, i1), line: l.slice(i1 + 1, i2), snippet: l.slice(i2 + 1) };
+  });
+}
+
+// Render locations as a directory-grouped tree, one row per file with a match count.
+// When moduleId is given and source is available, each file links into the source
+// viewer scrolled to the first match (every matched line stays highlighted).
+function buildLocationTree(locs, moduleId, colId = 'java-source-col', splitId = 'java-findings-col') {
+  return buildFileTree(locs, {
+    hasSource: path => moduleId != null && _javaSources[moduleId + '\x1f' + path] != null,
+    onClick: (path, line) => `showJavaSource(${moduleId}, ${jsStr(path)}, ${line}, '${colId}', '${splitId}')`,
+  });
+}
+
+// Shared file-level tree renderer. Collapses locations to ONE row per file with a
+// (N) match count — no per-line rows or line numbers (they add noise, and are
+// meaningless for minified JS). opts.hasSource(path) decides clickability; the
+// first location's line per file is the scroll target passed to opts.onClick.
+function buildFileTree(locs, opts) {
+  if (!locs || !locs.length) return '';
   const dirs = {};
+  const count = {};      // path -> match count
+  const firstLine = {};  // path -> first line seen (scroll target)
   for (const loc of locs) {
-    const slash = loc.path.lastIndexOf('/');
-    const dir  = slash >= 0 ? loc.path.slice(0, slash) : '';
-    const file = slash >= 0 ? loc.path.slice(slash + 1) : loc.path;
-    (dirs[dir] || (dirs[dir] = [])).push({ file, line: loc.line, path: loc.path });
+    if (count[loc.path] == null) {
+      count[loc.path] = 0;
+      firstLine[loc.path] = parseInt(loc.line, 10) || 0;
+      const slash = loc.path.lastIndexOf('/');
+      const dir  = slash >= 0 ? loc.path.slice(0, slash) : '';
+      const file = slash >= 0 ? loc.path.slice(slash + 1) : loc.path;
+      (dirs[dir] || (dirs[dir] = [])).push({ file, path: loc.path });
+    }
+    count[loc.path]++;
   }
-  const hasSource = f => moduleId != null && _javaSources[moduleId + '\x1f' + f.path] != null;
   return `<div class="font-mono text-xs space-y-0.5">
     ${Object.entries(dirs).sort(([a],[b]) => a.localeCompare(b)).map(([dir, files]) => `
       ${dir ? `<div class="text-gray-500 mt-1.5 first:mt-0">${esc(dir)}/</div>` : ''}
       ${files.map((f, i) => {
-        const clickable = hasSource(f);
-        const inner = `<span class="${clickable ? 'text-mx-blue group-hover:underline' : 'text-gray-300'}">${esc(f.file)}</span>${f.line ? `<span class="${clickable ? 'text-mx-blue/70' : 'text-gray-600'}">:${f.line}</span>` : ''}`;
+        const clickable = opts.hasSource(f.path);
+        const n = count[f.path];
+        const inner = `<span class="${clickable ? 'text-mx-blue group-hover:underline' : 'text-gray-300'}">${esc(f.file)}</span><span class="text-gray-600"> (${n})</span>`;
         return `
         <div class="flex items-baseline gap-2 ${dir ? 'pl-4' : ''}">
           <span class="text-gray-700 select-none">${i === files.length - 1 ? '└' : '├'}</span>
           ${clickable
-            ? `<a class="group cursor-pointer" onclick="showJavaSource(${moduleId}, ${jsStr(f.path)}, ${parseInt(f.line, 10) || 0})">${inner}</a>`
+            ? `<a class="group cursor-pointer" onclick="${opts.onClick(f.path, firstLine[f.path])}">${inner}</a>`
             : inner}
         </div>`;
       }).join('')}`).join('')}
@@ -3691,6 +4158,87 @@ function _refreshIssueRows() {
   if (count) count.textContent = `${filtered.length} of ${catalog.length} issues`;
   const clear = document.getElementById('issues-clear-wrap');
   if (clear) clear.innerHTML = _clearIssueBtn();
+}
+
+// Teams page — lists internal teams that own scanned components, with a shortcut
+// into the Components page filtered to each team. References the Content Ownership
+// app so people are nudged to keep the ownership data there up to date.
+function renderTeams() {
+  const teams = dbLayer.getTeams();
+
+  const ownershipRef = `
+    <div class="mb-5 flex items-start gap-3 rounded-lg border border-mx-blue/20 bg-mx-blue/5 p-4">
+      <svg class="w-5 h-5 flex-shrink-0 text-mx-blue mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+      <div class="text-sm text-gray-300 leading-relaxed">
+        Team ownership is sourced from the
+        <a href="https://mxcontentownership.mendixcloud.com/" target="_blank" rel="noopener" class="text-mx-blue hover:text-mx-blue/80 font-medium underline">Content Ownership app</a>.
+        If a component is unassigned or its owner looks wrong, please
+        <a href="https://mxcontentownership.mendixcloud.com/" target="_blank" rel="noopener" class="text-mx-blue hover:text-mx-blue/80 font-medium underline">update it there</a>
+        — this report picks up the change on the next scan.
+      </div>
+    </div>`;
+
+  if (!teams.length) {
+    document.getElementById('teams-view').innerHTML = `
+      <div class="p-6">
+        <div class="mb-5"><h2 class="text-2xl font-semibold text-white">Teams</h2></div>
+        ${ownershipRef}
+        <div class="text-center py-10 text-gray-500 text-sm">No internal team ownership data available in this scan.</div>
+      </div>`;
+    showView('teams-view');
+    return;
+  }
+
+  const slackCell = t => {
+    if (!t.slack_channel && !t.slack_url) return '<span class="text-gray-600">—</span>';
+    const label = esc(t.slack_channel || 'Slack');
+    return t.slack_url
+      ? `<a href="${esc(t.slack_url)}" target="_blank" rel="noopener" class="text-mx-blue hover:text-mx-blue/80">${label}</a>`
+      : `<span class="text-gray-300">${label}</span>`;
+  };
+
+  const rows = teams.map(t => {
+    const breaking = t.breaking_component_count > 0
+      ? `<span class="text-red-400 font-medium">${t.breaking_component_count}</span>`
+      : '<span class="text-gray-500">0</span>';
+    const hierarchy = [t.group_name, t.unit_name].filter(Boolean).map(esc).join(' › ') || '<span class="text-gray-600">—</span>';
+    const viewHref = '#' + buildHash({ view: 'components', params: { teams: t.name } });
+    return `
+      <tr class="hover:bg-dark-hover transition-colors">
+        <td class="px-4 py-3">
+          <div class="text-sm font-medium text-white">${esc(t.name)}</div>
+          ${t.jira_project ? `<div class="text-xs text-gray-500 mt-0.5">Jira: ${esc(t.jira_project)}</div>` : ''}
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-300">${hierarchy}</td>
+        <td class="px-4 py-3 text-sm">${slackCell(t)}</td>
+        <td class="px-4 py-3 text-sm text-gray-200">${t.component_count}</td>
+        <td class="px-4 py-3 text-sm">${breaking}</td>
+        <td class="px-4 py-3 text-right">
+          <a href="${viewHref}" class="inline-flex items-center gap-1 text-sm text-mx-blue hover:text-mx-blue/80">
+            View components
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+          </a>
+        </td>
+      </tr>`;
+  }).join('');
+
+  document.getElementById('teams-view').innerHTML = `
+    <div class="p-6">
+      <div class="mb-5">
+        <h2 class="text-2xl font-semibold text-white">Teams</h2>
+        <p class="text-gray-400 text-sm mt-1">${teams.length} internal team${teams.length !== 1 ? 's' : ''} owning scanned marketplace components</p>
+      </div>
+      ${ownershipRef}
+      ${card(`
+        <table class="min-w-full">
+          <thead class="bg-dark-bg/50"><tr>
+            ${th('Team')}${th('Group / Unit')}${th('Slack')}${th('Components')}${th('Breaking')}${th('')}
+          </tr></thead>
+          <tbody class="divide-y divide-dark-border">${rows}</tbody>
+        </table>
+      `)}
+    </div>`;
+  showView('teams-view');
 }
 
 function renderIssues() {
