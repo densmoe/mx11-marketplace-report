@@ -1,0 +1,43 @@
+# Deploys the redacted report to GitHub Pages on every push to main.
+#
+# The report artifacts are pushed here automatically by the GitLab CI
+# 'publish-public' job (redacted + verified upstream). This workflow just
+# serves them. Only the servable files are uploaded — README/.gitignore/.github
+# are kept out of the published site, mirroring the upstream file allowlist.
+# db-embedded.js is intentionally absent (it exceeds GitHub's 100MB limit and is
+# only a file:// fallback; the site fetches the ~10MB analysis.db.gz over HTTP).
+name: Deploy report to Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; newer pushes supersede in-flight runs.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage servable files
+        run: |
+          mkdir _site
+          cp index.html app.js db-layer.js scan-meta.js analysis.db.gz _site/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
