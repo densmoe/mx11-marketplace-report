@@ -683,13 +683,27 @@ class DatabaseLayer {
   }
 
   getWidgetFindings(widgetId) {
+    // Locations (path~line~snippet, records separated by X'1e') back the finding
+    // tree + snippet viewer. LEFT JOIN so findings without stored locations (older
+    // DBs, suppressed findings) still return, with locations null. Guarded so a DB
+    // predating the widget_finding_locations table degrades to the plain list.
+    const hasLocs = this._tableExists('widget_finding_locations');
+    const locSelect = hasLocs
+      ? `GROUP_CONCAT(wfl.file_path || '~' || wfl.line_number || '~' || COALESCE(wfl.snippet, ''), X'1e') AS locations`
+      : `NULL AS locations`;
+    const locJoin = hasLocs
+      ? `LEFT JOIN widget_finding_locations wfl ON wfl.widget_finding_id = wf.id`
+      : ``;
     return this.query(`
       SELECT
         f.id, f.rule, f.category, f.description, f.doc_url, f.doc_anchor,
-        wf.match_count, wf.certain, wf.suppressed
+        wf.match_count, wf.certain, wf.suppressed,
+        ${locSelect}
       FROM widget_findings wf
       JOIN findings f ON f.id = wf.finding_id
+      ${locJoin}
       WHERE wf.widget_id = ?
+      GROUP BY wf.id
       ORDER BY COALESCE(wf.suppressed, 0), f.category, f.rule
     `, [widgetId]);
   }

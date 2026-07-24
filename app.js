@@ -3,6 +3,12 @@
 let db = null;
 let dbLayer = null;
 
+// Public (redacted) build flag — injected into scan-meta.js by pkg/publish.
+// The public report is deep-link-only: recipients get direct links to the
+// components they own, so the browse surface (sidebar nav, dashboard, list and
+// issue views, back-to-list links) is hidden and blocked routes show a notice.
+const IS_PUBLIC_REPORT = window.PUBLIC_REPORT === true;
+
 // The component-detail Experiments tab is hidden by default. It appears only
 // when the URL carries the `showExperiments` param — which the Experiments-page
 // list rows attach, so the tab shows when you navigate in from there (or when
@@ -39,9 +45,30 @@ function navigateTo(view, id, params) {
   applyHash();
 }
 
+// Views reachable in the public (deep-link-only) build — detail pages of the
+// component a recipient was linked to, plus their widget/module subpages. All
+// list/aggregate views (dashboard, components, widgets, modules, starter apps,
+// issues, teams, experiments) are browse surface and stay blocked.
+const PUBLIC_VIEWS = { component: 1, widget: 1, module: 1 };
+
+// Landing shown in the public build for any blocked or unknown route (including
+// the bare report URL with no hash).
+function renderPublicLanding() {
+  document.getElementById('dashboard-view').innerHTML = `
+    <div class="flex items-center justify-center h-full p-8">
+      <div class="text-center max-w-md">
+        <h2 class="text-lg font-semibold text-white mb-2">MX11 Compatibility Report</h2>
+        <p class="text-sm text-gray-400">This report is accessed through direct component links.
+          Open the link you received to view the compatibility details for your component.</p>
+      </div>
+    </div>`;
+  showView('dashboard-view');
+}
+
 function applyHash() {
   if (!dbLayer) return;
   const { view, id, params } = parseHash();
+  if (IS_PUBLIC_REPORT && !(PUBLIC_VIEWS[view] && id)) { renderPublicLanding(); return; }
   _showExperiments = params.showExperiments === '1' || params.showExperiments === 'true';
   _selectedTab = params.selectedTab || null;
 
@@ -156,6 +183,11 @@ function initApp() {
   _applySupportDefault();
   renderScanDate();
   setupNav();
+  // Public build: no browsing — remove the entire sidebar nav.
+  if (IS_PUBLIC_REPORT) {
+    const aside = document.querySelector('aside');
+    if (aside) aside.remove();
+  }
   // Reveal the Teams nav item only when the DB carries internal ownership data.
   if (dbLayer.getDistinctTeams().length > 0) {
     const navTeams = document.getElementById('nav-teams');
@@ -213,11 +245,6 @@ function jsStr(s) {
   return "'" + String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') + "'";
 }
-
-// GitLab project root — used to deep-link maintainers to the suppressions file's
-// web editor so a confirmed false positive can be added without a local checkout.
-const GITLAB_REPO_URL = 'https://gitlab.rnd.mendix.com/online-platform/devops/marketplace-mx-11-scanner';
-const SUPPRESSIONS_EDIT_URL = `${GITLAB_REPO_URL}/-/edit/main/suppressions.yaml`;
 
 function badge(label, colorClass, title = '') {
   return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${colorClass}"${title ? ` title="${esc(title)}"` : ''}>${esc(label)}</span>`;
@@ -1831,7 +1858,7 @@ function setComponentDetailTab(tab) {
 
 function renderComponentDetail(marketplaceId) {
   const comp = dbLayer.getComponentDetail(marketplaceId);
-  if (!comp) { renderComponents(); return; }
+  if (!comp) { IS_PUBLIC_REPORT ? renderPublicLanding() : renderComponents(); return; }
 
   // Reset tab when navigating to a different component. A `selectedTab` URL
   // param (e.g. from an Experiments-page row) preselects that tab instead.
@@ -1853,7 +1880,8 @@ function renderComponentDetail(marketplaceId) {
   // widget-only and complex branches can render the Experiments tab.
   const expFindings = _showExperiments ? dbLayer.getExperimentalFindings(internalId) : [];
 
-  const backLink = `
+  // Public build: the components list is blocked, so no back-to-list link.
+  const backLink = IS_PUBLIC_REPORT ? '' : `
     <div class="mb-4">
       <a href="#" onclick="navigateTo('components'); return false;"
          class="text-mx-blue hover:text-mx-blue/80 text-sm inline-flex items-center gap-1">
@@ -3346,6 +3374,71 @@ function showWidgetExpMatches(widgetId, filePath) {
     </div>`;
 }
 
+// -- Widget finding matches (minified widget JS — snippets, not full source) -----
+//
+// Same model as the widget experiment matches: widget JS is minified so we never
+// store full source, only a short snippet per hit. Keyed by (rule, filePath) so a
+// widget detail page with multiple findings keeps them separate. Populated while
+// renderWidgetDetail builds the finding trees, read back by showWidgetFindingMatches.
+let _widgetFindingMatches = {}; // "rule\x1ffilePath" -> [{ line, snippet }]
+
+function registerWidgetFindingMatches(rule, locs) {
+  for (const l of locs) {
+    const key = rule + '\x1f' + l.path;
+    (_widgetFindingMatches[key] || (_widgetFindingMatches[key] = [])).push({
+      line: l.line, snippet: l.snippet || '',
+    });
+  }
+}
+
+// Clickable file tree for a widget finding's locations. Like the experiment tree,
+// every file is openable (we always have the captured snippets). rule is passed
+// through the click handler so the sidebar looks up the right match set.
+function buildWidgetFindingLocationTree(locs, rule) {
+  return buildFileTree(locs, {
+    hasSource: () => true,
+    onClick: path => `showWidgetFindingMatches(${jsStr(rule)}, ${jsStr(path)})`,
+  });
+}
+
+// Open a widget finding's captured snippets for a file in the wf-source column.
+// Mirrors showWidgetExpMatches: dedupes identical minified snippets with a ×N count.
+// Each snippet window is centered on a match, so no separate token highlight is
+// needed (unlike global-mx, we don't persist the matched literal per location).
+function showWidgetFindingMatches(rule, filePath) {
+  const col = document.getElementById('wf-source-col');
+  const split = document.getElementById('wf-findings-col');
+  if (!col) return;
+  const matches = _widgetFindingMatches[rule + '\x1f' + filePath] || [];
+  const fileName = filePath.includes('/') ? filePath.slice(filePath.lastIndexOf('/') + 1) : filePath;
+
+  const bySnippet = new Map();
+  for (const m of matches) {
+    const s = (m.snippet || '').trim();
+    bySnippet.set(s, (bySnippet.get(s) || 0) + 1);
+  }
+  const uniq = [...bySnippet.entries()];
+
+  const rows = uniq.length
+    ? uniq.map(([snip, n]) => `
+        <div class="px-3 py-2 border-b border-dark-border last:border-0">
+          ${n > 1 ? `<div class="text-xs text-gray-500 mb-1">×${n}</div>` : ''}
+          <pre class="text-xs text-gray-300 whitespace-pre-wrap break-all">${snip ? esc(snip) : '<span class="text-gray-600">(no snippet)</span>'}</pre>
+        </div>`).join('')
+    : `<div class="p-4 text-xs text-gray-500">No snippet captured.</div>`;
+
+  col.classList.remove('hidden');
+  if (split) split.classList.remove('flex-1'), split.classList.add('w-1/2');
+  col.innerHTML = `
+    <div class="rounded-lg border border-dark-border bg-dark-surface overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-2 border-b border-dark-border bg-dark-bg/60">
+        <span class="text-xs font-mono text-gray-300 truncate" title="${esc(filePath)}">${esc(fileName)} · ${uniq.length} unique · ${matches.length} match${matches.length !== 1 ? 'es' : ''}</span>
+        <button onclick="closeJSSource('wf-source-col','wf-findings-col')" class="text-gray-500 hover:text-gray-200 text-lg leading-none px-1">&times;</button>
+      </div>
+      <div class="overflow-auto" style="max-height:calc(100vh - 8rem)">${rows}</div>
+    </div>`;
+}
+
 // Directory-grouped tree for JS actions (mirror of buildLocationTree), linking to
 // showJSSource when the file's source is available. colId/splitId let the same tree
 // target either the JS Actions viewer or the Experiments viewer.
@@ -3509,103 +3602,10 @@ function setWidgetFilter(key, value) {
 // Widget detail
 // =============================================================================
 
-// =============================================================================
-// Suppression helper — guides a maintainer through adding a confirmed
-// false-positive (widget_id + rule) to suppressions.yaml.
-// =============================================================================
-
-// Build the YAML snippet for one (canonical widget id, rule) suppression entry.
-function _suppressionSnippet(canonicalId, rule, componentName) {
-  const reason = componentName ? `Confirmed false positive in ${componentName}` : 'Confirmed false positive';
-  return `  - widget_id: ${canonicalId}\n    rule: ${rule}\n    reason: ${reason}`;
-}
-
-async function copyToClipboard(text, btn) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch (_) {
-    // Fallback for non-secure contexts (file://) where the Clipboard API is blocked.
-    const ta = document.createElement('textarea');
-    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); } catch (_) {}
-    document.body.removeChild(ta);
-  }
-  if (btn) {
-    const orig = btn.dataset.label || btn.textContent;
-    btn.dataset.label = orig;
-    btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500);
-  }
-}
-
-function closeSuppressModal() {
-  const m = document.getElementById('suppress-modal');
-  if (m) m.remove();
-}
-
-// Open the "add to suppressions" dialog for a specific finding. Shows the exact
-// YAML to paste, a copy button, and a direct link to edit suppressions.yaml in
-// the GitLab web UI.
-function openSuppressModal(canonicalId, rule, componentName) {
-  closeSuppressModal();
-  const snippet = _suppressionSnippet(canonicalId, rule, componentName);
-  const wrap = document.createElement('div');
-  wrap.id = 'suppress-modal';
-  wrap.className = 'fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60';
-  wrap.onclick = e => { if (e.target === wrap) closeSuppressModal(); };
-  wrap.innerHTML = `
-    <div class="bg-dark-surface border border-dark-border rounded-lg shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
-      <div class="flex items-start justify-between px-5 py-4 border-b border-dark-border">
-        <div>
-          <h3 class="text-lg font-semibold text-white">Suppress this finding</h3>
-          <p class="text-xs text-gray-500 mt-0.5">Hide a confirmed false positive from counts, rollups, and the report</p>
-        </div>
-        <button onclick="closeSuppressModal()" class="text-gray-500 hover:text-gray-200 text-xl leading-none">&times;</button>
-      </div>
-      <div class="px-5 py-4 space-y-4">
-        <div class="text-sm text-gray-300 space-y-2">
-          <p>This adds one <code class="text-mx-blue">(widget, rule)</code> entry to
-            <code class="text-mx-blue">suppressions.yaml</code>. Use it only when the finding
-            has been <span class="text-white">verified</span> to be a false positive.
-            If a rule is wrong for <span class="text-white">every</span> widget, fix the rule instead.</p>
-        </div>
-
-        <div>
-          <div class="flex items-center justify-between mb-1.5">
-            <span class="text-xs font-medium text-gray-400 uppercase tracking-wider">YAML to add under <code>suppressions:</code></span>
-            <button data-label="Copy" onclick="copyToClipboard(this.parentElement.nextElementSibling.textContent, this)"
-                    class="text-xs px-2 py-1 rounded border border-dark-border text-gray-300 hover:text-white hover:border-blue-500/40 transition-colors">Copy</button>
-          </div>
-          <pre class="bg-dark-bg border border-dark-border rounded p-3 text-xs text-gray-200 font-mono overflow-x-auto whitespace-pre">${esc(snippet)}</pre>
-        </div>
-
-        <div class="text-sm text-gray-300 space-y-2">
-          <p class="text-xs font-medium text-gray-400 uppercase tracking-wider">How to apply</p>
-          <ol class="list-decimal list-inside space-y-1 text-sm text-gray-400">
-            <li>Open <code class="text-mx-blue">suppressions.yaml</code> in GitLab (button below).</li>
-            <li>Paste the snippet under the <code class="text-mx-blue">suppressions:</code> key
-                (replace <code class="text-mx-blue">suppressions: []</code> with <code class="text-mx-blue">suppressions:</code> if it's still empty).</li>
-            <li>Commit on a branch and open a merge request. CI regenerates the report on merge to <code class="text-mx-blue">main</code>.</li>
-          </ol>
-        </div>
-
-        <div class="flex items-center justify-end gap-2 pt-1">
-          <button onclick="closeSuppressModal()" class="text-sm px-3 py-1.5 rounded border border-dark-border text-gray-400 hover:text-gray-200 transition-colors">Close</button>
-          <a href="${esc(SUPPRESSIONS_EDIT_URL)}" target="_blank" rel="noopener"
-             class="text-sm px-3 py-1.5 rounded bg-mx-blue/15 text-mx-blue border border-mx-blue/30 hover:bg-mx-blue/25 transition-colors inline-flex items-center gap-1.5">
-            Edit suppressions.yaml in GitLab
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-          </a>
-        </div>
-      </div>
-    </div>`;
-  document.body.appendChild(wrap);
-}
 
 function renderWidgetDetail(widgetId) {
   const widget = dbLayer.getWidgetDetail(widgetId);
-  if (!widget) { renderComponentCategory('widgets'); return; }
+  if (!widget) { IS_PUBLIC_REPORT ? renderPublicLanding() : renderComponentCategory('widgets'); return; }
 
   const findings = dbLayer.getWidgetFindings(widgetId);
   const variants = dbLayer.getWidgetVariants(widgetId);
@@ -3617,27 +3617,46 @@ function renderWidgetDetail(widgetId) {
     if (row.id !== widgetId) seen.get(row.group_id).members.push(row);
   }
 
-  // Canonical widget id + component name identify a suppression entry; carried on
-  // the Suppress button via data-attrs so rule names with spaces need no escaping.
   const canonicalId = widget.widget_id || widget.name;
-  const findingRows = findings.filter(f => !f.suppressed).map(f => {
+  const activeFindings = findings.filter(f => !f.suppressed);
+
+  // Fresh per-rule snippet store for this widget (populated as we render the finding
+  // cards below, read back by showWidgetFindingMatches on click).
+  _widgetFindingMatches = {};
+
+  // Each finding renders as a card (rule badge + category + description + match
+  // count) with a clickable source-location tree, mirroring the Experiments panel.
+  // Clicking a file opens its captured snippets in the right-hand side column.
+  const findingCards = activeFindings.map(f => {
     const [bg, text] = findingCategoryColor(f.category);
+    const locs = parseExpLocs(f.locations);
+    if (locs.length) registerWidgetFindingMatches(f.rule, locs);
+    const tree = locs.length ? buildWidgetFindingLocationTree(locs, f.rule) : '';
     return `
-      <tr class="border-b border-dark-border last:border-0">
-        <td class="px-4 py-3">
-          <span class="inline-block px-2 py-0.5 ${bg} ${text} text-xs rounded border border-current/20">${esc(f.rule)}</span>
-        </td>
-        <td class="px-4 py-3 text-xs text-gray-400">${esc(f.category)}</td>
-        <td class="px-4 py-3 text-xs text-gray-300">${esc(f.description)}</td>
-        <td class="px-4 py-3 text-xs text-gray-500">${f.match_count > 0 ? f.match_count : '—'}</td>
-        <td class="px-4 py-3 whitespace-nowrap">
-          ${f.doc_url ? `<a href="${esc(f.doc_url)}" target="_blank" class="text-mx-blue text-xs hover:underline mr-3">Docs</a>` : ''}
-          <button data-wid="${esc(canonicalId)}" data-rule="${esc(f.rule)}" data-comp="${esc(widget.component_name || '')}"
-                  onclick="openSuppressModal(this.dataset.wid, this.dataset.rule, this.dataset.comp)"
-                  class="text-gray-500 hover:text-amber-400 text-xs transition-colors"
-                  title="Add this finding to the suppressions list as a confirmed false positive">Suppress</button>
-        </td>
-      </tr>`;
+      <div class="rounded-lg border border-dark-border overflow-hidden">
+        <div class="px-4 py-3 bg-dark-bg/30 flex items-start justify-between gap-4">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2 mb-1.5 flex-wrap">
+              <span class="inline-block px-2 py-0.5 ${bg} ${text} text-xs rounded border border-current/20 font-medium">${esc(f.rule)}</span>
+              <span class="text-xs text-gray-500">${esc(f.category)}</span>
+            </div>
+            <p class="text-xs text-gray-300 leading-relaxed">${esc(f.description)}</p>
+            <div class="flex items-center gap-3 mt-1.5">
+              ${f.doc_url ? `<a href="${esc(f.doc_url)}" target="_blank" class="text-xs text-mx-blue hover:underline">Documentation →</a>` : ''}
+              ${typeof _suppressButton === 'function' ? _suppressButton(canonicalId, f.rule, widget.component_name || '') : ''}
+            </div>
+          </div>
+          <div class="text-right flex-shrink-0 pt-0.5">
+            <div class="text-sm font-semibold text-gray-300">${f.match_count > 0 ? f.match_count : '—'}</div>
+            <div class="text-xs text-gray-600">matches</div>
+          </div>
+        </div>
+        ${tree ? `
+          <div class="px-4 py-3 border-t border-dark-border bg-dark-bg/60">
+            <div class="text-xs text-gray-600 uppercase tracking-wider mb-2">Source locations</div>
+            ${tree}
+          </div>` : ''}
+      </div>`;
   }).join('');
 
   const html = `
@@ -3679,15 +3698,13 @@ function renderWidgetDetail(widgetId) {
         </div>
       `)}
 
-      ${findings.length > 0 ? `
+      ${activeFindings.length > 0 ? `
         <div class="mt-4">
-          <h3 class="text-base font-semibold text-white mb-3">Findings (${findings.filter(f => !f.suppressed).length})</h3>
-          ${card(`
-            <table class="min-w-full">
-              <thead class="bg-dark-bg/50"><tr>${th('Rule')}${th('Category')}${th('Description')}${th('Matches')}${th('')}</tr></thead>
-              <tbody>${findingRows}</tbody>
-            </table>
-          `)}
+          <h3 class="text-base font-semibold text-white mb-3">Findings (${activeFindings.length})</h3>
+          <div id="wf-issues-split" class="flex gap-4 items-start">
+            <div id="wf-findings-col" class="flex-1 min-w-0 space-y-3">${findingCards}</div>
+            <div id="wf-source-col" class="hidden w-1/2 flex-shrink-0 sticky top-4"></div>
+          </div>
         </div>` : `
         <div class="mt-4 p-6 text-center text-green-400">
           <p class="text-sm font-medium">No compatibility issues found</p>
@@ -3777,7 +3794,7 @@ function setModuleFilter(key, value) {
 
 function renderModuleDetail(moduleId) {
   const mod = dbLayer.getModuleDetail(moduleId);
-  if (!mod) { renderComponentCategory('modules'); return; }
+  if (!mod) { IS_PUBLIC_REPORT ? renderPublicLanding() : renderComponentCategory('modules'); return; }
 
   const findings = dbLayer.getModuleFindings(moduleId);
   const locations = dbLayer.getModuleSourceLocations(moduleId);
