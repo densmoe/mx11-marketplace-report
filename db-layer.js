@@ -961,12 +961,17 @@ class DatabaseLayer {
   getSnapshotRollups() {
     if (!this.hasSnapshotHistory()) return [];
     if (this._snapshotRollups) return this._snapshotRollups;
+    // The Mx11-ready split was added later, and every report published before
+    // then lacks the columns. COALESCE does NOT help — SQLite still rejects an
+    // unknown column — so the column must be omitted from the SELECT entirely.
+    const mx11Ready = this.columnExists('snapshot_rollups', 'open_fail_mx11_ready')
+      ? `open_fail_mx11_ready, dl_open_fail_mx11_ready`
+      : `0 AS open_fail_mx11_ready, 0 AS dl_open_fail_mx11_ready`;
     this._snapshotRollups = this.query(`
       SELECT snapshot_id, criterion, content_type, support_type,
              components, pass, possible, open_fail, dep_fail, not_appl,
-             COALESCE(open_fail_mx11_ready, 0) AS open_fail_mx11_ready,
              downloads, dl_pass, dl_possible, dl_open_fail, dl_dep_fail,
-             COALESCE(dl_open_fail_mx11_ready, 0) AS dl_open_fail_mx11_ready
+             ${mx11Ready}
       FROM snapshot_rollups
     `);
     return this._snapshotRollups;
@@ -982,9 +987,12 @@ class DatabaseLayer {
 
   getSnapshotMovers() {
     if (!this.hasSnapshotHistory() || !this._tableExists('snapshot_movers')) return [];
+    // Same story as the rollup split: older reports have no result_status.
+    const resultStatus = this.columnExists('snapshot_movers', 'result_status')
+      ? `result_status` : `'' AS result_status`;
     return this.query(`
       SELECT snapshot_id, criterion, marketplace_id, name, publisher,
-             content_type, support_type, downloads, kind
+             content_type, support_type, downloads, kind, ${resultStatus}
       FROM snapshot_movers
       ORDER BY downloads DESC
     `);

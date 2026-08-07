@@ -181,9 +181,16 @@ function setupNav() {
 function initApp() {
   if (!dbLayer) { showError('Failed to load compatibility data.'); return; }
   _applySupportDefault();
-  // Snapshot history is optional — the dashboard degrades to today's snapshot
-  // when the DB predates the snapshot tables or holds fewer than two of them.
-  _tInit();
+  // Snapshot history is optional and must fail soft. initApp() runs inside the
+  // DB-load try/catch in webapp.html, so anything thrown here surfaces as
+  // "Failed to load compatibility data." and takes down the whole report —
+  // including component detail pages that do not use history at all.
+  try {
+    _tInit();
+  } catch (err) {
+    console.error('Snapshot history unavailable, continuing without trends:', err);
+    TREND.ready = false;
+  }
   renderScanDate();
   setupNav();
   // Public build: no browsing — remove the entire sidebar nav.
@@ -659,7 +666,7 @@ function _tInit() {
   for (const m of dbLayer.getSnapshotMovers()) {
     const list = moversBy.get(m.snapshot_id);
     if (list) list.push({ k: m.criterion, id: m.marketplace_id, name: m.name, pub: m.publisher,
-      c: m.content_type, s: m.support_type, dl: m.downloads, kind: m.kind });
+      c: m.content_type, s: m.support_type, dl: m.downloads, kind: m.kind, result: m.result_status || '' });
   }
 
   TREND.snapshots = snaps.map(s => ({
@@ -1492,6 +1499,14 @@ function _tRenderMovers() {
     regressed:    { col: _tCSS('--open'),      icon: '↓', verb: `now fails ${c.short}`, word: 'Newly failing' },
     reclassified: { col: _tCSS('--viz-ink'),   icon: '≈', verb: 'verdict changed, version did not', word: 'Reclassified' },
   }[kind];
+  // "Unresolved" means CONFIRMED breakage, so a component can leave that set by
+  // dropping to an uncertain finding rather than by passing outright. Saying
+  // "now passes" there contradicts its own detail page, which still shows a
+  // possible issue — so say what actually happened.
+  const verbFor = m => (kind === 'fixed' && m.result === 'warning')
+    ? { text: `no longer breaking ${c.short}`, col: _tCSS('--possible'),
+        title: `Dropped from a confirmed break to a possible issue — the detail page still shows a warning for ${c.label}.` }
+    : { text: meta.verb, col: meta.col, title: '' };
   const { movers, omitted } = _tMovers(c.key, kind);
   const span = _tPeriodSpanDays();
   document.getElementById('t-movers-sub').textContent = `Components whose ${c.label} status changed — last ${span} day${span === 1 ? '' : 's'}`;
@@ -1510,8 +1525,8 @@ function _tRenderMovers() {
             <div class="text-sm font-medium text-white">${esc(m.name)}</div>
             <div class="flex items-center gap-1.5 mt-1">${badge(m.s)}<span class="text-xs text-gray-500">${esc(m.c)} · ${esc(m.pub || '')}</span></div>
           </td>
-          <td class="px-2 py-2.5"><span class="inline-block px-1.5 py-0.5 border text-xs rounded"
-            style="color:${meta.col};border-color:${meta.col}33;background:${meta.col}14">${meta.verb}</span></td>
+          <td class="px-2 py-2.5">${(v => `<span class="inline-block px-1.5 py-0.5 border text-xs rounded"
+            style="color:${v.col};border-color:${v.col}33;background:${v.col}14"${v.title ? ` title="${esc(v.title)}"` : ''}>${v.text}</span>`)(verbFor(m))}</td>
           <td class="px-2 py-2.5 text-right whitespace-nowrap"><div class="text-sm text-gray-300 tnum">${_tNum(m.dl)}</div><div class="text-xs text-gray-500">downloads</div></td>
           <td class="pr-5 pl-2 py-2.5 text-right text-xs text-gray-500 whitespace-nowrap">${_tDate(m.when)}</td>
         </tr>`).join('')}
@@ -1520,7 +1535,7 @@ function _tRenderMovers() {
       ${movers.length > 12 ? `Showing 12 of ${_tNum(movers.length)}. ` : ''}
       ${kind === 'deprecated' ? 'Deprecation counts as resolved — the component still fails, but it is no longer offered to customers.'
         : kind === 'reclassified' ? 'These flipped without a new published version, so the change came from our scanner, not the marketplace.'
-        : kind === 'fixed' ? 'A newly published version cleared the criterion.'
+        : kind === 'fixed' ? `A newly published version cleared the confirmed break.${movers.some(m => m.result === 'warning') ? ' Amber rows dropped to a possible issue rather than passing outright.' : ''}`
         : 'Arrived failing, or a new version introduced the problem.'}
       ${omitted ? ` ${_tNum(omitted)} further transition${omitted === 1 ? ' was' : 's were'} recorded in aggregate but not listed individually.` : ''}
     </p>`;
