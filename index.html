@@ -37,6 +37,60 @@
   .code-viewer .code-content { padding:0 0.75rem; flex:1; }
   .code-viewer .code-line.hl { background-color:rgba(239,68,68,0.12); }
   .code-viewer .code-line.hl .code-gutter { color:#f87171; background-color:rgba(239,68,68,0.18); border-right-color:rgba(239,68,68,0.5); }
+
+  /* ── Dashboard trends ──────────────────────────────────────────────────────
+     Status steps are reserved (never reused for series identity) and validated
+     for colour-vision deficiency against the #161B22 card surface. The
+     "contained by deprecation" slate is deliberately low-chroma — like a
+     diverging midpoint it means "out of play" — and always ships with a label. */
+  :root {
+    --pass:       #0ca30c;
+    --possible:   #fab219;
+    --contained:  #5b7a99;
+    --open:       #d03b3b;
+    --viz-grid:   #232A33;
+    --viz-axis:   #30363D;
+    --viz-ink:    #9ca3af;
+    --viz-muted:  #6b7280;
+    --viz-surface:#161B22;
+  }
+  .tnum, .viz-table td, .viz-table th { font-variant-numeric: tabular-nums; }
+  .viz-svg text { font-family: inherit; }
+  .viz-tip {
+    position: fixed; z-index: 60; pointer-events: none; opacity: 0; transition: opacity .12s ease;
+    background: #0B0F14; border: 1px solid #30363D; border-radius: .5rem; padding: .55rem .7rem;
+    font-size: 12px; line-height: 1.5; box-shadow: 0 12px 28px -8px rgba(0,0,0,.75); min-width: 200px;
+  }
+  .viz-tip .k { color: #9ca3af; }
+  .viz-tip .v { color: #fff; font-variant-numeric: tabular-nums; }
+  .seg { display:inline-flex; border:1px solid #30363D; border-radius:.5rem; overflow:hidden; background:#161B22; }
+  .seg button { padding:.35rem .65rem; font-size:.75rem; font-weight:500; color:#9ca3af; background:transparent; cursor:pointer; transition:all .15s; border:0; }
+  .seg button + button { border-left:1px solid #30363D; }
+  .seg button:hover { background:#1C2128; color:#e5e7eb; }
+  .seg button.on { background:#0595DB; color:#fff; }
+  select.crit {
+    appearance:none; background-color:#161B22; border:1px solid #30363D; border-radius:.5rem;
+    color:#fff; font-size:.875rem; font-weight:500; padding:.5rem 2.25rem .5rem .75rem; cursor:pointer;
+    background-image:url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' stroke='%239ca3af' stroke-width='2' viewBox='0 0 24 24'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat:no-repeat; background-position:right .6rem center; background-size:1rem;
+  }
+  select.crit:hover { border-color:#0595DB; }
+  select.crit optgroup { background:#0E1419; color:#6b7280; font-style:normal; }
+  select.crit option { background:#161B22; color:#e5e7eb; }
+  .combo-btn {
+    display:inline-flex; align-items:center; gap:.5rem; min-width:9.5rem; justify-content:space-between;
+    background:#161B22; border:1px solid #30363D; border-radius:.5rem; color:#e5e7eb;
+    font-size:.8125rem; font-weight:500; padding:.5rem .65rem; cursor:pointer; transition:border-color .15s;
+  }
+  .combo-btn:hover, .combo-btn.active { border-color:#0595DB; }
+  .combo-panel {
+    position:absolute; z-index:50; top:calc(100% + .35rem); left:0; min-width:15rem;
+    background:#0B0F14; border:1px solid #30363D; border-radius:.5rem; box-shadow:0 16px 32px -10px rgba(0,0,0,.8);
+  }
+  .combo-opt { display:flex; align-items:center; gap:.6rem; padding:.4rem .75rem; font-size:.8125rem; color:#e5e7eb; cursor:pointer; }
+  .combo-opt:hover { background:#1C2128; }
+  .combo-opt input { accent-color:#0595DB; width:.9rem; height:.9rem; cursor:pointer; }
+  .crit-card.on { border-color:#0595DB !important; background:#12212b; }
 </style>
 </head>
 <body class="bg-dark-bg text-gray-100 antialiased">
@@ -128,6 +182,8 @@
       <div id="issue-detail-view"     class="view hidden"></div>
     </main>
   </div>
+
+  <div class="viz-tip" id="viz-tip"></div>
 
   <script src="scan-meta.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>

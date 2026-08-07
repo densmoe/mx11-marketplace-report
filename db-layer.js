@@ -78,60 +78,8 @@ class DatabaseLayer {
   // Dashboard
   // =============================================================================
 
-  getStats() {
-    return this.queryOne(`
-      SELECT
-        COUNT(DISTINCT c.id)                                    AS total_components,
-        COUNT(DISTINCT w.id)                                    AS total_widgets,
-        COUNT(DISTINCT m.id)                                    AS total_modules,
-        COUNT(DISTINCT CASE WHEN w.broken_always OR w.breaks116 THEN w.id END) AS breaking_widgets,
-        COUNT(DISTINCT CASE WHEN NOT w.broken_always AND NOT w.breaks116 AND w.issue_count = 0 THEN w.id END) AS compatible_widgets
-      FROM components c
-      LEFT JOIN widgets   w ON w.component_id = c.id
-      LEFT JOIN modules   m ON m.component_id = c.id
-    `);
-  }
 
-  getComponentBreakdown() {
-    return this.query(`
-      SELECT
-        c.content_type,
-        c.support_type,
-        COUNT(DISTINCT c.id)                                    AS component_count,
-        COUNT(DISTINCT w.id)                                    AS widget_count,
-        COUNT(DISTINCT CASE WHEN w.broken_always OR w.breaks116 THEN w.id END) AS breaking_widget_count,
-        COUNT(DISTINCT m.id)                                    AS module_count,
-        COUNT(DISTINCT CASE WHEN mf.certain THEN m.id END)     AS breaking_module_count
-      FROM components c
-      LEFT JOIN widgets w ON w.component_id = c.id
-      LEFT JOIN modules m ON m.component_id = c.id
-      LEFT JOIN module_findings mf ON mf.module_id = m.id
-      GROUP BY c.content_type, c.support_type
-      ORDER BY c.content_type, c.support_type
-    `);
-  }
 
-  getPriorityComponents(limit = 10) {
-    return this.query(`
-      SELECT
-        c.id, c.marketplace_id, c.name, c.content_type, c.support_type, c.react_client_ready,
-        c.min_mx_version, c.download_count, c.permalink, c.publisher,
-        COUNT(DISTINCT w.id)                                          AS widget_count,
-        COUNT(DISTINCT CASE WHEN w.broken_always THEN w.id END)      AS broken_always_count,
-        COUNT(DISTINCT CASE WHEN w.breaks116 THEN w.id END)          AS breaks116_count,
-        COUNT(DISTINCT m.id)                                          AS module_count,
-        COUNT(DISTINCT CASE WHEN mf.certain THEN m.id END)           AS breaking_module_count
-      FROM components c
-      LEFT JOIN widgets w ON w.component_id = c.id
-      LEFT JOIN modules m ON m.component_id = c.id
-      LEFT JOIN module_findings mf ON mf.module_id = m.id
-      WHERE c.scan_error = '' OR c.scan_error IS NULL
-      GROUP BY c.id
-      HAVING (broken_always_count > 0 OR breaks116_count > 0 OR breaking_module_count > 0)
-      ORDER BY broken_always_count DESC, breaks116_count DESC, c.download_count DESC
-      LIMIT ?
-    `, [limit]);
-  }
 
   // =============================================================================
   // Components
@@ -980,28 +928,66 @@ class DatabaseLayer {
   // Health stats (non-compatibility quality warnings)
   // =============================================================================
 
-  getHealthStats() {
-    const components = this.getComponents();
-    const ONE_YEAR_MS = 365 * 24 * 3600 * 1000;
-    const cutoff = Date.now() - ONE_YEAR_MS;
-    let notImportable = 0, stale = 0, unmanagedDeps = 0, starterNoReact = 0, starterNoMprV2 = 0;
-    for (const c of components) {
-      if (c.support_type === 'Deprecated') continue;
-      const isModuleType = c.content_type === 'Module' || (c.module_count > 0 && c.content_type !== 'Widget');
-      if (isModuleType && c.min_mx_version && this.compareVersions(c.min_mx_version, '10.21.0') < 0)
-        notImportable++;
-      const lastUpdate = c.last_publish_date || c.changed_date;
-      if (lastUpdate && new Date(lastUpdate).getTime() < cutoff)
-        stale++;
-      if ((c.unmanaged_dep_count || 0) > 0)
-        unmanagedDeps++;
-      if (c.content_type === 'Starter App') {
-        if (!c.react_client_ready) starterNoReact++;
-        if (c.min_mx_version && this.compareVersions(c.min_mx_version, '9.24.0') < 0)
-          starterNoMprV2++;
-      }
-    }
-    return { notImportable, stale, unmanagedDeps, starterNoReact, starterNoMprV2 };
+
+  // ===========================================================================
+  // Snapshot history (dashboard trends)
+  //
+  // Written by pkg/history during the scan: every published report carries the
+  // whole series, so there is no side file to load. Older databases predate
+  // these tables, hence the guards — the dashboard falls back to today's
+  // snapshot when history is absent.
+  // ===========================================================================
+
+  hasSnapshotHistory() {
+    if (this._hasHistory !== undefined) return this._hasHistory;
+    // Two snapshots is the minimum that can express a change.
+    this._hasHistory = this._tableExists('snapshots')
+      && this._tableExists('snapshot_rollups')
+      && (this.queryOne(`SELECT COUNT(*) AS n FROM snapshots`) || {}).n >= 2;
+    return this._hasHistory;
+  }
+
+  getSnapshots() {
+    if (!this.hasSnapshotHistory()) return [];
+    return this.query(`
+      SELECT id, scanned_at, source_ref, component_count, movers_omitted
+      FROM snapshots ORDER BY scanned_at
+    `);
+  }
+
+  // All rollup cells, at criterion x content-type x support-type grain. Loaded
+  // once and aggregated in JS — same pattern as getComponents(), and it is what
+  // lets the dashboard's filters subset history without a query per toggle.
+  getSnapshotRollups() {
+    if (!this.hasSnapshotHistory()) return [];
+    if (this._snapshotRollups) return this._snapshotRollups;
+    this._snapshotRollups = this.query(`
+      SELECT snapshot_id, criterion, content_type, support_type,
+             components, pass, possible, open_fail, dep_fail, not_appl,
+             COALESCE(open_fail_mx11_ready, 0) AS open_fail_mx11_ready,
+             downloads, dl_pass, dl_possible, dl_open_fail, dl_dep_fail,
+             COALESCE(dl_open_fail_mx11_ready, 0) AS dl_open_fail_mx11_ready
+      FROM snapshot_rollups
+    `);
+    return this._snapshotRollups;
+  }
+
+  getSnapshotChanges() {
+    if (!this.hasSnapshotHistory() || !this._tableExists('snapshot_changes')) return [];
+    return this.query(`
+      SELECT snapshot_id, criterion, fixed, deprecated, regressed, reclassified, arrived, departed
+      FROM snapshot_changes
+    `);
+  }
+
+  getSnapshotMovers() {
+    if (!this.hasSnapshotHistory() || !this._tableExists('snapshot_movers')) return [];
+    return this.query(`
+      SELECT snapshot_id, criterion, marketplace_id, name, publisher,
+             content_type, support_type, downloads, kind
+      FROM snapshot_movers
+      ORDER BY downloads DESC
+    `);
   }
 
   getWidgetVariants(widgetId) {

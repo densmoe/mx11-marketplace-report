@@ -181,6 +181,9 @@ function setupNav() {
 function initApp() {
   if (!dbLayer) { showError('Failed to load compatibility data.'); return; }
   _applySupportDefault();
+  // Snapshot history is optional — the dashboard degrades to today's snapshot
+  // when the DB predates the snapshot tables or holds fewer than two of them.
+  _tInit();
   renderScanDate();
   setupNav();
   // Public build: no browsing — remove the entire sidebar nav.
@@ -566,210 +569,1255 @@ function healthWarningBadge(c) {
 }
 
 // =============================================================================
+// Dashboard trends — snapshot history
+//
+// Read from the report database itself: pkg/history writes snapshot_rollups /
+// snapshot_changes / snapshot_movers during the scan, and every published
+// report carries the whole series forward. Older databases predate those
+// tables, so this degrades to today's snapshot alone.
+//
+// The model: under a chosen criterion every applicable component is in exactly
+// one of four states — passing, possible issue, failing-but-deprecated, or
+// failing-and-live. Deprecation is a RESOLUTION, not a removal: it stops
+// customers being steered into content that would block their upgrade. So
+// "resolved = fixed + deprecated", and the headline is open failures — failing
+// AND still installable.
+// =============================================================================
+
+// Display metadata for the criteria. pkg/facets.Criteria is the source of truth
+// for which criteria EXIST; this only supplies labels. Any key found in the data
+// but missing here still renders, using its raw key — so adding a criterion in
+// Go never silently drops it from the UI.
+const CRITERION_LABELS = {
+  'mx10':         { label: 'Mendix 10 compatible',      short: 'Mx10',         group: 'Compatibility' },
+  'mx11':         { label: 'Mendix 11 compatible',      short: 'Mx11',         group: 'Compatibility' },
+  'react-client': { label: 'React Client compatible',   short: 'React Client', group: 'Compatibility' },
+  'new-string':   { label: 'New string handling',       short: 'New String',   group: 'Compatibility' },
+  'mx12':         { label: 'Mendix 12+ ready',          short: 'Mx12+',        group: 'Compatibility' },
+  'managed-deps': { label: 'Managed Java dependencies', short: 'Managed deps', group: 'Health' },
+  'importable':   { label: 'Importable into Mendix 11', short: 'Importable',   group: 'Health' },
+  'maintained':   { label: 'Actively maintained',       short: 'Maintained',   group: 'Health' },
+};
+const CRITERION_ORDER = Object.keys(CRITERION_LABELS);
+
+const TREND = {
+  ready: false,
+  criteria: [],
+  segments: [],
+  snapshots: [],
+  state: { criterion: 'mx11', days: 7, measure: 'count', view: 'chart', movers: 'fixed', content: [], support: [] },
+};
+
+function _tInit() {
+  if (!dbLayer || !dbLayer.hasSnapshotHistory()) return false;
+  const snaps = dbLayer.getSnapshots();
+  const rollups = dbLayer.getSnapshotRollups();
+  if (snaps.length < 2 || !rollups.length) return false;
+
+  // Intern segments locally; the DB stores them as plain strings per row.
+  const segIndex = new Map();
+  TREND.segments = [];
+  const segId = (c, s) => {
+    const key = `${c} ${s}`;
+    if (!segIndex.has(key)) { segIndex.set(key, TREND.segments.length); TREND.segments.push([c, s]); }
+    return segIndex.get(key);
+  };
+
+  const critKeys = [...new Set(rollups.map(r => r.criterion))];
+  critKeys.sort((a, b) => {
+    const ia = CRITERION_ORDER.indexOf(a), ib = CRITERION_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  TREND.criteria = critKeys.map(key => ({
+    key,
+    label: (CRITERION_LABELS[key] || {}).label || key,
+    short: (CRITERION_LABELS[key] || {}).short || key,
+    group: (CRITERION_LABELS[key] || {}).group || 'Other',
+  }));
+  const critIdx = Object.fromEntries(critKeys.map((k, i) => [k, i]));
+
+  // Reshape into the row form the chart code consumes:
+  // [criterionIdx, segmentIdx, components, pass, possible, open, contained, na,
+  //  downloads, dlPass, dlPossible, dlOpen, dlContained]
+  const bySnapshot = new Map(snaps.map(s => [s.id, []]));
+  for (const r of rollups) {
+    const rows = bySnapshot.get(r.snapshot_id);
+    if (!rows) continue;
+    rows.push([critIdx[r.criterion], segId(r.content_type, r.support_type),
+      r.components, r.pass, r.possible, r.open_fail, r.dep_fail, r.not_appl,
+      r.downloads, r.dl_pass, r.dl_possible, r.dl_open_fail, r.dl_dep_fail,
+      r.open_fail_mx11_ready || 0, r.dl_open_fail_mx11_ready || 0]);
+  }
+
+  const changesBy = new Map(snaps.map(s => [s.id, []]));
+  for (const c of dbLayer.getSnapshotChanges()) {
+    const list = changesBy.get(c.snapshot_id);
+    if (list) list.push({ k: c.criterion, fixed: c.fixed, deprecated: c.deprecated, regressed: c.regressed,
+      reclassified: c.reclassified, arrived: c.arrived, departed: c.departed });
+  }
+  const moversBy = new Map(snaps.map(s => [s.id, []]));
+  for (const m of dbLayer.getSnapshotMovers()) {
+    const list = moversBy.get(m.snapshot_id);
+    if (list) list.push({ k: m.criterion, id: m.marketplace_id, name: m.name, pub: m.publisher,
+      c: m.content_type, s: m.support_type, dl: m.downloads, kind: m.kind });
+  }
+
+  TREND.snapshots = snaps.map(s => ({
+    t: Date.parse(s.scanned_at),
+    rows: bySnapshot.get(s.id) || [],
+    changes: changesBy.get(s.id) || [],
+    movers: moversBy.get(s.id) || [],
+    moversOmitted: s.movers_omitted || 0,
+  })).filter(s => !isNaN(s.t)).sort((a, b) => a.t - b.t);
+
+  TREND.contentTypes = [...new Set(TREND.segments.map(s => s[0]))].sort();
+  TREND.supportTypes = [...new Set(TREND.segments.map(s => s[1]))].sort();
+  if (!TREND.criteria.some(c => c.key === TREND.state.criterion)) {
+    TREND.state.criterion = (TREND.criteria[0] || {}).key;
+  }
+  TREND.ready = TREND.criteria.length > 0 && TREND.snapshots.length >= 2;
+  return TREND.ready;
+}
+
+const _tCrit = () => TREND.criteria.find(c => c.key === TREND.state.criterion) || TREND.criteria[0];
+const _tNum = n => Math.round(n).toLocaleString('en-US');
+const _tDate = ms => new Date(ms).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+const _tCSS = k => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+const _SVGNS = 'http://www.w3.org/2000/svg';
+const _tEl = (tag, attrs = {}) => {
+  const n = document.createElementNS(_SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+};
+
+// Which interned segments survive the content/support filters.
+function _tAllowedSegments() {
+  const { content, support } = TREND.state;
+  return TREND.segments.map(([c, s]) =>
+    (!content.length || content.includes(c)) && (!support.length || support.includes(s)));
+}
+
+const _tSeriesCache = new Map();
+function _tCacheKey(critKey) {
+  return `${critKey}|${TREND.state.content.join(',')}|${TREND.state.support.join(',')}`;
+}
+
+// Per-snapshot totals for one criterion over the segments in scope.
+function _tSeries(critKey) {
+  const ck = _tCacheKey(critKey);
+  if (_tSeriesCache.has(ck)) return _tSeriesCache.get(ck);
+  const ci = TREND.criteria.findIndex(c => c.key === critKey);
+  const allow = _tAllowedSegments();
+  const out = TREND.snapshots.map(s => {
+    const a = { t: s.t, comps: 0, pass: 0, possible: 0, open: 0, contained: 0, na: 0,
+                dl: 0, dlPass: 0, dlPossible: 0, dlOpen: 0, dlContained: 0,
+                claimsMx11: 0, dlClaimsMx11: 0 };
+    for (const r of s.rows) {
+      if (r[0] !== ci || !allow[r[1]]) continue;
+      a.comps += r[2]; a.pass += r[3]; a.possible += r[4]; a.open += r[5]; a.contained += r[6]; a.na += r[7];
+      a.dl += r[8]; a.dlPass += r[9]; a.dlPossible += r[10]; a.dlOpen += r[11]; a.dlContained += r[12];
+      a.claimsMx11 += r[13] || 0; a.dlClaimsMx11 += r[14] || 0;
+    }
+    // An unresolved failure splits into two different problems. A component that
+    // only supports Mx10 or older BLOCKS an upgrade: a team adopts it today and
+    // finds out months later that it pins them below Mendix 11. One that
+    // advertises Mendix 11 support and fails anyway is broken right now for
+    // anyone who believed the listing.
+    a.blockers = Math.max(0, a.open - a.claimsMx11);
+    a.dlBlockers = Math.max(0, a.dlOpen - a.dlClaimsMx11);
+    a.applicable = a.comps - a.na;
+    // Downloads carry no NA bucket of their own; the applicable download base is
+    // exactly the four states summed.
+    a.dlApplicable = a.dlPass + a.dlPossible + a.dlOpen + a.dlContained;
+    return a;
+  });
+  _tSeriesCache.set(ck, out);
+  return out;
+}
+
+// Bands under the current weight toggle.
+function _tBands(p) {
+  return TREND.state.measure === 'usage'
+    ? { pass: p.dlPass, possible: p.dlPossible, contained: p.dlContained, open: p.dlOpen, total: p.dlApplicable }
+    : { pass: p.pass, possible: p.possible, contained: p.contained, open: p.open, total: p.applicable };
+}
+
+const _T_BANDS = [
+  { k: 'open',      name: 'Failing · live',       cvar: '--open' },
+  { k: 'contained', name: 'Failing · deprecated', cvar: '--contained' },
+  { k: 'possible',  name: 'Possible issue',       cvar: '--possible' },
+  { k: 'pass',      name: 'Passing',              cvar: '--pass' },
+];
+
+// Index of the snapshot to compare against. Snapshots are NOT evenly spaced —
+// a pipeline can be skipped for days — so the period resolves by timestamp and
+// picks the newest snapshot at or before the cutoff, never a fixed offset.
+function _tPeriodStart() {
+  const S = TREND.snapshots;
+  if (TREND.state.days === 'all') return 0;
+  const cutoff = S[S.length - 1].t - TREND.state.days * 86400000;
+  // Nearest to the cutoff, either side. Taking the newest at-or-before instead
+  // meant a scan four minutes past the cutoff was skipped for the one a day
+  // earlier, and a 7-day request reported "8 days" — technically honest, but it
+  // reads as a bug when the scans are plainly daily.
+  let idx = 0, best = Infinity;
+  for (let i = 0; i < S.length - 1; i++) {
+    const d = Math.abs(S[i].t - cutoff);
+    if (d < best) { best = d; idx = i; }
+  }
+  return idx;
+}
+
+// Actual span covered, which can exceed the requested period when snapshots are
+// missing. Reporting "7 days" over a 13-day gap would be a lie.
+function _tPeriodSpanDays() {
+  const S = TREND.snapshots;
+  return Math.max(1, Math.round((S[S.length - 1].t - S[_tPeriodStart()].t) / 86400000));
+}
+
+// Sum the per-snapshot transitions across the comparison window.
+function _tChanges(critKey) {
+  const start = _tPeriodStart();
+  const agg = { fixed: 0, deprecated: 0, regressed: 0, reclassified: 0, arrived: 0, departed: 0 };
+  for (let i = start + 1; i < TREND.snapshots.length; i++) {
+    for (const c of (TREND.snapshots[i].changes || [])) {
+      if (c.k !== critKey) continue;
+      for (const k in agg) agg[k] += c[k] || 0;
+    }
+  }
+  return agg;
+}
+
+// Named component transitions in the window, newest first, most-downloaded
+// first within a snapshot. Deduped so one component appears once.
+function _tMovers(critKey, kind) {
+  const start = _tPeriodStart();
+  const { content, support } = TREND.state;
+  const seen = new Set(), out = [];
+  let omitted = 0;
+  for (let i = TREND.snapshots.length - 1; i > start; i--) {
+    const s = TREND.snapshots[i];
+    omitted += s.moversOmitted || 0;
+    for (const m of (s.movers || [])) {
+      if (m.k !== critKey || m.kind !== kind) continue;
+      if (content.length && !content.includes(m.c)) continue;
+      if (support.length && !support.includes(m.s)) continue;
+      if (seen.has(m.id)) continue;
+      seen.add(m.id);
+      out.push({ ...m, when: s.t });
+    }
+  }
+  return { movers: out, omitted };
+}
+
+const _tTip = () => document.getElementById('viz-tip');
+function _tShowTip(html, x, y) {
+  const tip = _tTip();
+  if (!tip) return;
+  tip.innerHTML = html;
+  tip.style.opacity = '1';
+  tip.style.left = Math.min(window.innerWidth - tip.offsetWidth - 12, Math.max(8, x + 14)) + 'px';
+  tip.style.top = Math.max(8, y - tip.offsetHeight - 12) + 'px';
+}
+function _tHideTip() { const tip = _tTip(); if (tip) tip.style.opacity = '0'; }
+
+// Arrow + sign + word, so direction never rides on colour alone.
+function _tDelta(v, goodIsUp) {
+  if (!v) return '<span class="text-gray-500">no change</span>';
+  const good = goodIsUp ? v > 0 : v < 0;
+  const col = good ? _tCSS('--pass') : _tCSS('--open');
+  return `<span class="tnum" style="color:${col}">${v > 0 ? '▲' : '▼'} ${v > 0 ? '+' : '−'}${_tNum(Math.abs(v))}</span>`;
+}
+
+// Draw into a host at its measured width, and redraw whenever that width
+// changes. Tailwind is loaded from a CDN at runtime, so on first paint the grid
+// classes may still have no CSS and every cell measures the full container
+// width — a one-shot clientWidth read bakes that mistake in permanently. The
+// observer also covers window resizes and the sidebar appearing.
+const _tResizeObserver = typeof ResizeObserver !== 'undefined'
+  ? new ResizeObserver(entries => {
+      for (const e of entries) {
+        const w = Math.round(e.contentRect.width);
+        if (!e.target._tDraw || w <= 0 || w === e.target._tWidth) continue;
+        e.target._tWidth = w;
+        e.target._tDraw(w);
+      }
+    })
+  : null;
+
+function _tAutoDraw(host, draw) {
+  if (!host) return;
+  host._tDraw = draw;
+  const w = Math.round(host.getBoundingClientRect().width);
+  host._tWidth = w;
+  if (w > 0) draw(w);
+  if (_tResizeObserver) _tResizeObserver.observe(host);
+}
+
+// fixedW pins the width (for hosts that are not full-bleed, like the hero
+// sparkline sitting next to flexible text); otherwise the host is measured and
+// observed.
+function _tSparkline(host, values, color, h, fixedW) {
+  if (!host || !values.length) return;
+  if (fixedW) { _tDrawSparkline(host, values, color, fixedW, h); return; }
+  host.style.overflow = 'hidden';
+  _tAutoDraw(host, w => _tDrawSparkline(host, values, color, w, h));
+}
+
+function _tDrawSparkline(host, values, color, w, h) {
+  host.innerHTML = '';
+  const svg = _tEl('svg', { width: w, height: h, class: 'viz-svg', 'aria-hidden': 'true' });
+  const min = Math.min(...values), max = Math.max(...values), rng = (max - min) || 1;
+  const X = i => (i / Math.max(1, values.length - 1)) * (w - 6) + 3;
+  const Y = v => h - 5 - ((v - min) / rng) * (h - 10);
+  const d = values.map((v, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+  svg.appendChild(_tEl('path', { d: `${d} L${X(values.length - 1)},${h} L${X(0)},${h} Z`, fill: color, 'fill-opacity': '.09' }));
+  svg.appendChild(_tEl('path', { d, fill: 'none', stroke: color, 'stroke-width': '2', 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+  svg.appendChild(_tEl('circle', { cx: X(values.length - 1), cy: Y(values[values.length - 1]), r: 4, fill: color, stroke: _tCSS('--viz-surface'), 'stroke-width': '2' }));
+  host.appendChild(svg);
+}
+
+// -----------------------------------------------------------------------------
+// Trends markup
+// -----------------------------------------------------------------------------
+
+function _tSectionHTML() {
+  if (!TREND.ready) {
+    return `<div class="bg-dark-surface rounded-lg border border-dark-border px-5 py-4 mb-6">
+      <p class="text-sm text-gray-400">Trend data not available yet.</p>
+      <p class="text-xs text-gray-500 mt-1">This report carries fewer than two snapshots. A scan run with
+      <code class="text-gray-400">--history-archive</code> carries the series forward from the previously published report;
+      <code class="text-gray-400">mx-scanner history --repo &lt;snapshot-archive&gt;</code> rebuilds it from the full archive.</p>
+    </div>`;
+  }
+  const groups = [...new Set(TREND.criteria.map(c => c.group))];
+  return `
+    <div class="flex flex-wrap items-center gap-x-7 gap-y-3 mb-6 pb-5 border-b border-dark-border">
+      <div class="flex items-center gap-2.5">
+        <span class="text-xs text-gray-500 uppercase tracking-wider font-medium">Criterion</span>
+        <select class="crit" id="t-criterion">
+          ${groups.map(g => `<optgroup label="${esc(g)}">
+            ${TREND.criteria.filter(c => c.group === g).map(c =>
+              `<option value="${esc(c.key)}"${c.key === TREND.state.criterion ? ' selected' : ''}>${esc(c.label)}</option>`).join('')}
+          </optgroup>`).join('')}
+        </select>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs text-gray-500 uppercase tracking-wider font-medium">Compare over</span>
+        <div class="seg" id="t-period">
+          ${[1, 7, 14, 30, 90].map(d => `<button data-v="${d}"${d === TREND.state.days ? ' class="on"' : ''}>${d}d</button>`).join('')}<button data-v="all"${TREND.state.days === 'all' ? ' class="on"' : ''}>All</button>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs text-gray-500 uppercase tracking-wider font-medium">Weight</span>
+        <div class="seg" id="t-measure">
+          <button data-v="count"${TREND.state.measure === 'count' ? ' class="on"' : ''}>Per component</button
+          ><button data-v="usage"${TREND.state.measure === 'usage' ? ' class="on"' : ''}>By downloads</button>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs text-gray-500 uppercase tracking-wider font-medium">Content type</span>
+        <div id="t-combo-content"></div>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs text-gray-500 uppercase tracking-wider font-medium">Support type</span>
+        <div id="t-combo-support"></div>
+      </div>
+      <div id="t-scope" class="text-xs text-gray-500 basis-full"></div>
+    </div>
+
+    <div id="t-empty" class="hidden bg-dark-surface rounded-lg border border-dark-border px-5 py-12 text-center mb-6">
+      <p class="text-sm text-gray-400" id="t-empty-msg"></p>
+      <button id="t-reset" class="mt-3 text-xs text-mx-blue hover:underline">Clear filters</button>
+    </div>
+
+    <div id="t-body">
+      <div class="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-6">
+        <div class="lg:col-span-2 bg-dark-surface rounded-lg border border-dark-border p-5">
+          <div class="flex items-start justify-between gap-4">
+            <div class="min-w-0">
+              <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Upgrade blockers</p>
+              <div class="flex items-baseline gap-3 mt-2">
+                <span id="t-hero" class="text-[52px] leading-none font-semibold text-white tnum"></span>
+                <span id="t-hero-delta" class="text-sm font-medium"></span>
+              </div>
+              <p id="t-hero-sub" class="text-xs text-gray-500 mt-2"></p>
+            </div>
+            <div class="flex-shrink-0 pt-1"><div id="t-hero-spark"></div></div>
+          </div>
+        </div>
+        <div class="bg-dark-surface rounded-lg border border-dark-border p-4">
+          <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Already broken on Mx11</p>
+          <div class="flex items-baseline gap-2 mt-1.5">
+            <span id="t-claims" class="text-3xl font-semibold text-white tnum"></span>
+            <span id="t-claims-delta" class="text-xs font-medium"></span>
+          </div>
+          <p id="t-claims-sub" class="text-xs text-gray-500 mt-1"></p>
+          <div id="t-claims-spark" class="mt-2.5"></div>
+        </div>
+        <div class="bg-dark-surface rounded-lg border border-dark-border p-4">
+          <p class="text-xs font-medium text-gray-500 uppercase tracking-wider">Resolved in period</p>
+          <div class="flex items-baseline gap-2 mt-1.5">
+            <span id="t-resolved" class="text-3xl font-semibold text-white tnum"></span>
+            <span id="t-resolved-note" class="text-xs text-gray-500"></span>
+          </div>
+          <p id="t-resolved-sub" class="text-xs text-gray-500 mt-1"></p>
+          <div id="t-resolved-split" class="mt-2.5"></div>
+          <p id="t-contained" class="text-xs text-gray-500 mt-2 pt-2 border-t border-dark-border"></p>
+        </div>
+      </div>
+
+      <div class="bg-dark-surface rounded-lg border border-dark-border mb-6">
+        <div class="px-5 py-4 border-b border-dark-border flex items-start justify-between gap-4 flex-wrap">
+          <div>
+            <h3 class="text-sm font-semibold text-white" id="t-chart-title"></h3>
+            <p class="text-xs text-gray-500 mt-0.5" id="t-chart-sub"></p>
+          </div>
+          <div class="flex items-center gap-3">
+            <div class="flex items-center gap-3.5 text-xs" id="t-legend"></div>
+            <div class="seg" id="t-view">
+              <button data-v="chart"${TREND.state.view === 'chart' ? ' class="on"' : ''}>Chart</button
+              ><button data-v="table"${TREND.state.view === 'table' ? ' class="on"' : ''}>Table</button>
+            </div>
+          </div>
+        </div>
+        <div class="p-5">
+          <div id="t-chart"></div>
+          <div id="t-table" class="hidden max-h-96 overflow-y-auto"></div>
+          <div id="t-rule-legend" class="mt-3 flex flex-wrap gap-x-6 gap-y-1.5"></div>
+        </div>
+      </div>
+
+      <div class="mb-6">
+        <div class="flex items-baseline gap-2 mb-3">
+          <h3 class="text-sm font-semibold text-white">All criteria</h3>
+          <span class="text-xs text-gray-500">Unresolved failures per criterion — click a card to scope the dashboard to it.</span>
+        </div>
+        <div id="t-cards" class="grid grid-cols-2 md:grid-cols-4 gap-3"></div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-5 gap-4 mb-6">
+        <div class="lg:col-span-2 bg-dark-surface rounded-lg border border-dark-border">
+          <div class="px-5 py-4 border-b border-dark-border">
+            <h3 class="text-sm font-semibold text-white">What actually changed</h3>
+            <p class="text-xs text-gray-500 mt-0.5" id="t-wf-sub"></p>
+          </div>
+          <div class="p-5"><div id="t-waterfall"></div></div>
+        </div>
+        <div class="lg:col-span-3 bg-dark-surface rounded-lg border border-dark-border">
+          <div class="px-5 py-4 border-b border-dark-border flex items-start justify-between gap-3 flex-wrap">
+            <div>
+              <h3 class="text-sm font-semibold text-white">Movers</h3>
+              <p class="text-xs text-gray-500 mt-0.5" id="t-movers-sub"></p>
+            </div>
+            <div class="seg" id="t-movers-kind">
+              <button data-v="fixed" class="on">Fixed</button
+              ><button data-v="deprecated">Deprecated</button
+              ><button data-v="regressed">Newly failing</button
+              ><button data-v="reclassified">Reclassified</button>
+            </div>
+          </div>
+          <div id="t-movers"></div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-5 gap-4 mb-6">
+        <div class="lg:col-span-3 bg-dark-surface rounded-lg border border-dark-border">
+          <div class="px-5 py-4 border-b border-dark-border">
+            <h3 class="text-sm font-semibold text-white">Chase these first</h3>
+            <p class="text-xs text-gray-500 mt-0.5" id="t-worst-sub"></p>
+          </div>
+          <div id="t-worst"></div>
+        </div>
+        <div class="lg:col-span-2 bg-dark-surface rounded-lg border border-dark-border">
+          <div class="px-5 py-4 border-b border-dark-border">
+            <h3 class="text-sm font-semibold text-white">Where it concentrates</h3>
+            <p class="text-xs text-gray-500 mt-0.5" id="t-conc-sub"></p>
+          </div>
+          <div id="t-conc"></div>
+        </div>
+      </div>
+    </div>`;
+}
+
+// -----------------------------------------------------------------------------
+// Trends rendering
+// -----------------------------------------------------------------------------
+
+function _tRenderScope() {
+  const allow = _tAllowedSegments();
+  const { content, support } = TREND.state;
+  const last = TREND.snapshots[TREND.snapshots.length - 1];
+  let comps = 0, dl = 0;
+  const ci = 0; // any criterion covers every segment; counts are criterion-independent
+  for (const r of last.rows) if (r[0] === ci && allow[r[1]]) { comps += r[2]; dl += r[8]; }
+  const total = last.rows.filter(r => r[0] === ci).reduce((a, r) => a + r[2], 0);
+  const el = document.getElementById('t-scope');
+  if (!el) return;
+  const filtered = content.length || support.length;
+  el.innerHTML = filtered
+    ? `Scoped to <span class="text-gray-300">${esc(content.join(', ') || 'all content types')}</span> ·
+       <span class="text-gray-300">${esc(support.join(', ') || 'all support types')}</span> —
+       <span class="text-gray-300 tnum">${_tNum(comps)}</span> of ${_tNum(total)} components,
+       <span class="text-gray-300 tnum">${_tNum(dl)}</span> downloads.
+       <button id="t-scope-reset" class="text-mx-blue hover:underline ml-1">Reset</button>`
+    : `${_tNum(TREND.snapshots.length)} snapshots from ${_tDate(TREND.snapshots[0].t)} to ${_tDate(last.t)} ·
+       all <span class="text-gray-300 tnum">${_tNum(total)}</span> components in scope.`;
+  const reset = document.getElementById('t-scope-reset');
+  if (reset) reset.addEventListener('click', () => { TREND.state.content = []; TREND.state.support = []; _tRedrawCombos(); _tRender(); });
+}
+
+function _tRenderKPIs() {
+  const c = _tCrit(), s = _tSeries(c.key);
+  const last = s[s.length - 1], first = s[_tPeriodStart()];
+  const span = _tPeriodSpanDays();
+  const usage = TREND.state.measure === 'usage';
+  const unit = usage ? 'downloads' : 'components';
+  const val = (p, k) => usage ? p['dl' + k[0].toUpperCase() + k.slice(1)] : p[k];
+
+  // Headline is the upgrade blockers, not the raw failure count. A component
+  // that fails and only supports Mx10 or older is the actual harm: a team adopts
+  // it today and discovers months later that it pins them below Mendix 11.
+  const blockNow = val(last, 'blockers'), blockThen = val(first, 'blockers');
+  document.getElementById('t-hero').textContent = _tNum(blockNow);
+  document.getElementById('t-hero-delta').innerHTML =
+    `${_tDelta(blockNow - blockThen, false)} <span class="text-gray-500">vs ${span} day${span === 1 ? '' : 's'} ago</span>`;
+  document.getElementById('t-hero-sub').innerHTML =
+    `${usage ? 'Downloads on components that fail' : 'Components that fail'} <span class="text-gray-400">${esc(c.label)}</span>,
+     are still published, and support only Mendix 10 or older. A team adopting one today is pinned below Mendix 11 until it is fixed.`;
+  _tSparkline(document.getElementById('t-hero-spark'), s.map(p => val(p, 'blockers')), _tCSS('--open'), 52, 140);
+
+  // The other half of the same failure: it advertises Mendix 11 and fails anyway.
+  const claimNow = val(last, 'claimsMx11'), claimThen = val(first, 'claimsMx11');
+  document.getElementById('t-claims').textContent = _tNum(claimNow);
+  document.getElementById('t-claims-delta').innerHTML = _tDelta(claimNow - claimThen, false);
+  document.getElementById('t-claims-sub').innerHTML =
+    `advertise Mendix 11 support and still fail <span class="text-gray-400">${esc(c.short)}</span> — broken now for anyone who believed the listing`;
+  _tSparkline(document.getElementById('t-claims-spark'), s.map(p => val(p, 'claimsMx11')), _tCSS('--open'), 34);
+
+  const ch = _tChanges(c.key);
+  const resolved = ch.fixed + ch.deprecated;
+  document.getElementById('t-resolved').textContent = _tNum(resolved);
+  document.getElementById('t-resolved-note').textContent = `in ${span} day${span === 1 ? '' : 's'}`;
+  document.getElementById('t-resolved-sub').innerHTML =
+    `<span class="tnum" style="color:${_tCSS('--pass')}">${_tNum(ch.fixed)} fixed</span> ·
+     <span class="tnum" style="color:${_tCSS('--contained')}">${_tNum(ch.deprecated)} deprecated</span>`;
+  const denom = Math.max(1, resolved);
+  document.getElementById('t-resolved-split').innerHTML = `
+    <div class="flex h-2.5 rounded-sm overflow-hidden" style="background:#ffffff0d">
+      <div style="width:${100 * ch.fixed / denom}%;background:${_tCSS('--pass')}"></div>
+      <div style="width:2px;background:${_tCSS('--viz-surface')}"></div>
+      <div style="width:${100 * ch.deprecated / denom}%;background:${_tCSS('--contained')}"></div>
+    </div>`;
+  // Deprecation stops new adoption; it does not unblock teams that already
+  // installed the component. Say so rather than let it read as a clean fix.
+  document.getElementById('t-contained').innerHTML =
+    `<span class="tnum" style="color:${_tCSS('--contained')}">${_tNum(last.contained)}</span> contained by deprecation —
+     no longer offered, but teams already on them stay blocked until they migrate off.`;
+
+  document.getElementById('t-chart-title').textContent = `${c.label} — status over time`;
+  const shown = s.length - _tPeriodStart();
+  document.getElementById('t-chart-sub').textContent = TREND.state.days === 'all'
+    ? `All ${_tNum(s.length)} scans, ${_tDate(s[0].t)} to ${_tDate(last.t)}.`
+    : `${_tNum(shown)} scan${shown === 1 ? '' : 's'} over the last ${span} day${span === 1 ? '' : 's'}.`;
+  document.getElementById('t-legend').innerHTML = _T_BANDS
+    .filter(b => s.some(p => _tBands(p)[b.k] > 0)).slice().reverse()
+    .map(b => `<span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm" style="background:${_tCSS(b.cvar)}"></span><span class="text-gray-400">${b.name}</span></span>`)
+    .join('');
+  document.getElementById('t-wf-sub').textContent = `Unresolved failures, decomposed over the last ${span} day${span === 1 ? '' : 's'}`;
+}
+
+// Main chart: 100% stacked area over a real time axis (snapshots are irregular,
+// so an index axis would misplace every gap), plus a containment strip re-based
+// on the failing population — where deprecated failures are ~1% of the catalog
+// they are a hairline in the chart above, but a legible share of the failures.
+function _tRenderChart() {
+  _tAutoDraw(document.getElementById('t-chart'), w => _tDrawChart(w));
+}
+
+function _tDrawChart(W) {
+  const host = document.getElementById('t-chart');
+  if (!host) return;
+  host.innerHTML = '';
+  // Scoped to the selected period, like everything else on the page. "All" is
+  // in the period control for when the full series is what you want.
+  const c = _tCrit(), offset = _tPeriodStart(), rows = _tSeries(c.key).slice(offset);
+  const H = 314, PAD = { t: 14, r: 74, b: 56, l: 44 };
+  const iw = W - PAD.l - PAD.r, ih = H - PAD.t - PAD.b;
+  const t0 = rows[0].t, t1 = rows[rows.length - 1].t;
+  const X = t => PAD.l + (t1 === t0 ? iw / 2 : ((t - t0) / (t1 - t0)) * iw);
+  const Y = p => PAD.t + ih - (p / 100) * ih;
+
+  const svg = _tEl('svg', { width: W, height: H, class: 'viz-svg', role: 'img',
+    'aria-label': `Share of applicable components passing, possibly affected, failing but deprecated, or failing and live, for ${c.label}` });
+
+  [0, 25, 50, 75, 100].forEach(p => {
+    svg.appendChild(_tEl('line', { x1: PAD.l, x2: PAD.l + iw, y1: Y(p), y2: Y(p), stroke: _tCSS('--viz-grid'), 'stroke-width': '1' }));
+    const t = _tEl('text', { x: PAD.l - 8, y: Y(p) + 4, 'text-anchor': 'end', fill: _tCSS('--viz-muted'), 'font-size': '11' });
+    t.textContent = p + '%'; svg.appendChild(t);
+  });
+
+  const active = _T_BANDS.filter(b => rows.some(p => _tBands(p)[b.k] > 0));
+  const cum = rows.map(() => 0);
+  active.forEach((b, bi) => {
+    const lower = cum.slice();
+    rows.forEach((p, i) => { const v = _tBands(p); cum[i] += v.total ? 100 * v[b.k] / v.total : 0; });
+    const up = rows.map((p, i) => `${i ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(cum[i]).toFixed(1)}`).join(' ');
+    const down = rows.map((p, i) => `L${X(rows[rows.length - 1 - i].t).toFixed(1)},${Y(lower[rows.length - 1 - i]).toFixed(1)}`).join(' ');
+    // Large fills stay muted; a saturated block at this size reads loud.
+    svg.appendChild(_tEl('path', { d: `${up} ${down} Z`, fill: _tCSS(b.cvar), 'fill-opacity': '0.58' }));
+    // 2px surface gap does the separating — never a stroke around the mark.
+    if (bi < active.length - 1) svg.appendChild(_tEl('path', { d: up, fill: 'none', stroke: _tCSS('--viz-surface'), 'stroke-width': '2' }));
+    b._share = cum[cum.length - 1] - lower[lower.length - 1];
+    b._mid = (cum[cum.length - 1] + lower[lower.length - 1]) / 2;
+  });
+  // Direct-label selectively: only bands with room for the text.
+  active.forEach(b => {
+    if (b._share < 6) return;
+    const t = _tEl('text', { x: PAD.l + iw + 8, y: Y(b._mid) + 4, fill: _tCSS('--viz-ink'), 'font-size': '11', 'font-weight': '500' });
+    t.textContent = b._share.toFixed(1) + '%'; svg.appendChild(t);
+  });
+
+  svg.appendChild(_tEl('line', { x1: PAD.l, x2: PAD.l + iw, y1: Y(0), y2: Y(0), stroke: _tCSS('--viz-axis'), 'stroke-width': '1' }));
+
+  // Label by pixel spacing, not by index: on a time axis a run of daily scans
+  // after a two-week gap sits almost on top of itself, and every-nth-index
+  // labelling would print them overlapping.
+  const MIN_LABEL_GAP = 68;
+  let lastLabelX = -Infinity;
+  const labelled = new Set([rows.length - 1]);
+  rows.forEach((p, i) => {
+    if (i === rows.length - 1) return;
+    if (X(p.t) - lastLabelX < MIN_LABEL_GAP) return;
+    if (X(rows[rows.length - 1].t) - X(p.t) < MIN_LABEL_GAP) return; // keep clear of the pinned last label
+    lastLabelX = X(p.t);
+    labelled.add(i);
+  });
+  rows.forEach((p, i) => {
+    if (!labelled.has(i)) return;
+    const t = _tEl('text', { x: X(p.t), y: H - 10, 'text-anchor': 'middle', fill: _tCSS('--viz-muted'), 'font-size': '11' });
+    t.textContent = _tDate(p.t); svg.appendChild(t);
+  });
+  // A tick per snapshot, so irregular scan cadence is visible rather than implied.
+  rows.forEach(p => svg.appendChild(_tEl('line', { x1: X(p.t), x2: X(p.t), y1: Y(0), y2: Y(0) + 4, stroke: _tCSS('--viz-axis'), 'stroke-width': '1' })));
+
+  // Scanner-rule changes. A snapshot with a non-zero "reclassified" count is one
+  // where components changed verdict WITHOUT publishing a new version — the
+  // ecosystem did not move, our rules did. Marking them on the axis is what stops
+  // a step in the line being read as progress. Derived from the data, so it needs
+  // no hand-maintained list of rule edits.
+  const rawEvents = [];
+  rows.forEach((p, i) => {
+    const n = (TREND.snapshots[offset + i].changes || []).find(x => x.k === c.key);
+    if (n && n.reclassified) rawEvents.push({ delta: n.reclassified, t: p.t });
+  });
+  // Rule edits land in bursts — several scans in one afternoon — and at this
+  // scale their markers overlap into an unreadable smear of letters. Merge any
+  // that fall within a marker's width of each other and sum the effect, so one
+  // glyph means one episode rather than one scan.
+  const MARKER_GAP = 18;
+  const ruleEvents = [];
+  for (const ev of rawEvents) {
+    const prev = ruleEvents[ruleEvents.length - 1];
+    if (prev && X(ev.t) - X(prev.t) < MARKER_GAP) {
+      prev.delta += ev.delta;
+      prev.merged++;
+      prev.until = ev.t;
+    } else {
+      ruleEvents.push({ ...ev, merged: 1, until: ev.t });
+    }
+  }
+  ruleEvents.forEach((ev, k) => {
+    const mx = X(ev.t);
+    svg.appendChild(_tEl('line', { x1: mx, x2: mx, y1: PAD.t, y2: Y(0), stroke: _tCSS('--viz-muted'), 'stroke-width': '1', 'stroke-opacity': '.55' }));
+    const g = _tEl('g', { style: 'cursor:help' });
+    g.appendChild(_tEl('path', { d: `M${mx},${Y(0) + 3} l-5,8 l10,0 Z`, fill: _tCSS('--viz-ink') }));
+    const lb = _tEl('text', { x: mx, y: Y(0) + 21, 'text-anchor': 'middle', fill: _tCSS('--viz-ink'), 'font-size': '9', 'font-weight': '700' });
+    lb.textContent = String.fromCharCode(65 + (k % 26));
+    g.appendChild(lb);
+    g.appendChild(_tEl('rect', { x: mx - 12, y: Y(0), width: 24, height: 26, fill: 'transparent' }));
+    const when = ev.merged > 1
+      ? `${_tDate(ev.until) !== _tDate(ev.t) ? `${_tDate(ev.t)} – ${_tDate(ev.until)}` : _tDate(ev.t)}, ${ev.merged} scans`
+      : _tDate(ev.t);
+    g.addEventListener('mousemove', e => _tShowTip(
+      `<div class="v" style="font-weight:600;margin-bottom:2px">Scanner rule change ${String.fromCharCode(65 + (k % 26))}</div>
+       <div class="k" style="margin-bottom:4px">${when}</div>
+       <div class="k" style="max-width:250px">${_tNum(Math.abs(ev.delta))} component${Math.abs(ev.delta) === 1 ? '' : 's'}
+       changed verdict without publishing a new version — the components did not change, our rules did.</div>
+       <div style="margin-top:6px;padding-top:5px;border-top:1px solid #30363D" class="k">Effect
+       <span class="v">${ev.delta > 0 ? '+' : '−'}${_tNum(Math.abs(ev.delta))}</span> unresolved — excluded from progress</div>`,
+      e.clientX, e.clientY));
+    g.addEventListener('mouseleave', _tHideTip);
+    svg.appendChild(g);
+  });
+
+  const cross = _tEl('line', { y1: PAD.t, y2: Y(0), stroke: _tCSS('--viz-ink'), 'stroke-width': '1', 'stroke-opacity': '0', 'pointer-events': 'none' });
+  svg.appendChild(cross);
+  const hit = _tEl('rect', { x: PAD.l, y: PAD.t, width: iw, height: ih, fill: 'transparent' });
+  const nearest = clientX => {
+    const bx = svg.getBoundingClientRect();
+    const want = t0 + ((clientX - bx.left - PAD.l) / iw) * (t1 - t0);
+    let best = 0;
+    rows.forEach((p, i) => { if (Math.abs(p.t - want) < Math.abs(rows[best].t - want)) best = i; });
+    return best;
+  };
+  hit.addEventListener('mousemove', e => {
+    const p = rows[nearest(e.clientX)], v = _tBands(p);
+    cross.setAttribute('x1', X(p.t)); cross.setAttribute('x2', X(p.t)); cross.setAttribute('stroke-opacity', '.45');
+    const line = b => `<div style="display:flex;align-items:center;gap:8px;justify-content:space-between">
+        <span style="display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:2px;background:${_tCSS(b.cvar)};display:inline-block"></span><span class="k">${b.name}</span></span>
+        <span class="v">${_tNum(v[b.k])} <span class="k">${v.total ? (100 * v[b.k] / v.total).toFixed(1) : '0.0'}%</span></span></div>`;
+    _tShowTip(`<div class="v" style="font-weight:600;margin-bottom:5px">${_tDate(p.t)}</div>
+      ${_T_BANDS.filter(b => v[b.k] > 0).map(line).join('')}
+      <div style="margin-top:5px;padding-top:5px;border-top:1px solid #30363D;display:flex;justify-content:space-between;gap:10px">
+        <span class="k">Applicable ${TREND.state.measure === 'usage' ? 'downloads' : 'components'}</span><span class="v">${_tNum(v.total)}</span></div>`,
+      e.clientX, e.clientY);
+  });
+  hit.addEventListener('mouseleave', () => { _tHideTip(); cross.setAttribute('stroke-opacity', '0'); });
+  svg.appendChild(hit);
+  host.appendChild(svg);
+
+  // Containment strip.
+  const SH = 78, sTop = 18, sh = SH - sTop - 4;
+  const s2 = _tEl('svg', { width: W, height: SH, class: 'viz-svg', role: 'img',
+    'aria-label': 'Of the components failing this criterion, the share contained by deprecation versus still unresolved' });
+  const cap = _tEl('text', { x: PAD.l, y: 11, fill: _tCSS('--viz-muted'), 'font-size': '10', 'letter-spacing': '.04em' });
+  cap.textContent = 'OF THOSE FAILING — CONTAINED BY DEPRECATION vs STILL UNRESOLVED';
+  s2.appendChild(cap);
+  const failing = rows.map(p => { const v = _tBands(p); return { c: v.contained, o: v.open, tot: v.contained + v.open }; });
+  const SY = pc => sTop + sh - (pc / 100) * sh;
+  const depTop = failing.map(f => f.tot ? 100 * f.c / f.tot : 0);
+  s2.appendChild(_tEl('rect', { x: PAD.l, y: sTop, width: iw, height: sh, fill: _tCSS('--open'), 'fill-opacity': '0.58' }));
+  const upPath = depTop.map((pc, i) => `${i ? 'L' : 'M'}${X(rows[i].t).toFixed(1)},${SY(pc).toFixed(1)}`).join(' ');
+  s2.appendChild(_tEl('path', { d: `${upPath} L${X(t1)},${SY(0)} L${X(t0)},${SY(0)} Z`, fill: _tCSS('--contained'), 'fill-opacity': '0.85' }));
+  s2.appendChild(_tEl('path', { d: upPath, fill: 'none', stroke: _tCSS('--viz-surface'), 'stroke-width': '2' }));
+  const et = _tEl('text', { x: PAD.l + iw + 8, y: sTop + sh / 2 + 4, fill: _tCSS('--viz-ink'), 'font-size': '11', 'font-weight': '500', class: 'tnum' });
+  et.textContent = (depTop[depTop.length - 1] || 0).toFixed(1) + '%';
+  s2.appendChild(et);
+  const sHit = _tEl('rect', { x: PAD.l, y: sTop, width: iw, height: sh, fill: 'transparent' });
+  sHit.addEventListener('mousemove', e => {
+    const i = nearest(e.clientX), f = failing[i];
+    _tShowTip(`<div class="v" style="font-weight:600;margin-bottom:5px">${_tDate(rows[i].t)}</div>
+      <div style="display:flex;justify-content:space-between;gap:14px"><span class="k">Failing, total</span><span class="v">${_tNum(f.tot)}</span></div>
+      <div style="display:flex;justify-content:space-between;gap:14px"><span class="k">— contained</span><span class="v">${_tNum(f.c)} · ${(f.tot ? 100 * f.c / f.tot : 0).toFixed(1)}%</span></div>
+      <div style="display:flex;justify-content:space-between;gap:14px"><span class="k">— still unresolved</span><span class="v">${_tNum(f.o)}</span></div>`,
+      e.clientX, e.clientY);
+  });
+  sHit.addEventListener('mouseleave', _tHideTip);
+  s2.appendChild(sHit);
+  host.appendChild(s2);
+
+  const legend = document.getElementById('t-rule-legend');
+  if (legend) {
+    legend.innerHTML = ruleEvents.length
+      ? ruleEvents.map((ev, k) => `<span class="inline-flex items-start gap-2 text-xs text-gray-500">
+          <span class="inline-flex items-center justify-center w-4 h-4 rounded-sm bg-gray-700 text-gray-200 text-[9px] font-bold flex-shrink-0 mt-px">${String.fromCharCode(65 + (k % 26))}</span>
+          <span>${ev.merged > 1 && _tDate(ev.until) !== _tDate(ev.t) ? `${_tDate(ev.t)}–${_tDate(ev.until)}` : _tDate(ev.t)} — <span class="text-gray-400">scanner rule change</span>
+          <span class="text-gray-600 tnum">(${ev.delta > 0 ? '+' : '−'}${_tNum(Math.abs(ev.delta))} unresolved, not the ecosystem)</span></span></span>`).join('')
+      : '<span class="text-xs text-gray-600">No scanner-rule changes affected this criterion in the recorded history.</span>';
+  }
+}
+
+function _tRenderTable() {
+  const host = document.getElementById('t-table');
+  if (!host) return;
+  const c = _tCrit(), rows = _tSeries(c.key).slice(_tPeriodStart()).reverse();
+  const cols = _T_BANDS.filter(b => rows.some(p => _tBands(p)[b.k] > 0));
+  const unit = TREND.state.measure === 'usage' ? 'downloads' : 'components';
+  host.innerHTML = `
+    <table class="viz-table min-w-full text-sm"><thead class="sticky top-0 bg-dark-surface"><tr class="text-left">
+      ${['Snapshot', ...cols.map(b => b.name), `Applicable ${unit}`, 'Resolved %'].map(h =>
+        `<th class="px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-dark-border whitespace-nowrap">${h}</th>`).join('')}
+    </tr></thead><tbody class="divide-y divide-dark-border">
+      ${rows.map(p => { const v = _tBands(p); return `
+        <tr class="hover:bg-dark-hover">
+          <td class="px-3 py-1.5 text-gray-300 whitespace-nowrap">${_tDate(p.t)}</td>
+          ${cols.map(b => `<td class="px-3 py-1.5 text-gray-400">${_tNum(v[b.k])}</td>`).join('')}
+          <td class="px-3 py-1.5 text-gray-400">${_tNum(v.total)}</td>
+          <td class="px-3 py-1.5 text-white font-medium">${v.total ? (100 * (v.total - v.open) / v.total).toFixed(1) : '—'}%</td>
+        </tr>`; }).join('')}
+    </tbody></table>`;
+}
+
+function _tRenderCards() {
+  const host = document.getElementById('t-cards');
+  if (!host) return;
+  const start = _tPeriodStart();
+  host.innerHTML = TREND.criteria.map(c => {
+    const s = _tSeries(c.key), last = s[s.length - 1], first = s[start];
+    const na = last.applicable === 0;
+    return `<div class="crit-card bg-dark-surface rounded-lg p-3.5 border border-dark-border hover:border-blue-500/40 cursor-pointer transition-colors ${c.key === TREND.state.criterion ? 'on' : ''}" data-crit="${esc(c.key)}">
+      <div class="flex items-start justify-between gap-2">
+        <p class="text-xs font-medium text-gray-400 uppercase tracking-wider leading-tight">${esc(c.short)}</p>
+        <span class="text-[10px] text-gray-600 uppercase tracking-wider flex-shrink-0">${esc(c.group)}</span>
+      </div>
+      ${na
+        ? `<div class="mt-1.5"><span class="text-2xl font-semibold text-gray-600">—</span></div>
+           <p class="text-xs text-gray-600 mt-0.5">not applicable in this scope</p><div class="h-[34px] mt-2"></div>
+           <p class="text-xs text-gray-700 mt-1.5">&nbsp;</p>`
+        : `<div class="flex items-baseline gap-2 mt-1.5">
+             <span class="text-2xl font-semibold text-white tnum">${_tNum(last.open)}</span>
+             <span class="text-xs">${_tDelta(last.open - first.open, false)}</span>
+           </div>
+           <p class="text-xs text-gray-600 mt-0.5">unresolved of ${_tNum(last.applicable)} applicable</p>
+           <div class="mt-2" data-spark="${esc(c.key)}"></div>
+           <p class="text-xs mt-1.5" style="color:var(--contained)">${_tNum(last.contained)} contained by deprecation</p>`}
+    </div>`;
+  }).join('');
+  TREND.criteria.forEach(c => {
+    const box = host.querySelector(`[data-spark="${CSS.escape(c.key)}"]`);
+    if (!box) return;
+    // Each card auto-scales: these are different measures on very different
+    // bases, so a shared scale would flatten most of them. The exact number
+    // above carries the magnitude; the line carries the shape.
+    _tSparkline(box, _tSeries(c.key).map(p => p.open), '#0595DB', 34);
+  });
+  host.querySelectorAll('[data-crit]').forEach(n => n.addEventListener('click', () => {
+    TREND.state.criterion = n.dataset.crit;
+    const sel = document.getElementById('t-criterion');
+    if (sel) sel.value = TREND.state.criterion;
+    _tRender();
+  }));
+}
+
+// Balances as text, movement as diverging bars. A zero-anchored column chart
+// renders a 3-component step against a base of 190 as an invisible sliver at
+// every short period, and truncating the axis to fix that would misstate the
+// totals — so the two facts get different marks.
+function _tRenderWaterfall() {
+  _tAutoDraw(document.getElementById('t-waterfall'), w => _tDrawWaterfall(w));
+}
+
+function _tDrawWaterfall(W) {
+  const host = document.getElementById('t-waterfall');
+  if (!host) return;
+  host.innerHTML = '';
+  const c = _tCrit(), s = _tSeries(c.key), ch = _tChanges(c.key);
+  const start = s[_tPeriodStart()].open, end = s[s.length - 1].open;
+
+  const steps = [
+    { label: 'Reclassified', v: ch.reclassified, kind: 'neutral',
+      note: 'Status changed with no new published version — the component did not move, our scanner rules did. Never counted as progress.' },
+    { label: 'Fixed', v: -ch.fixed, kind: 'pass',
+      note: 'The maintainer published a new version that clears the criterion.' },
+    { label: 'Deprecated', v: -ch.deprecated, kind: 'contained',
+      note: 'Still failing, but marked deprecated — customers are no longer steered into installing it. Counts as resolved.' },
+    { label: 'Newly failing', v: ch.regressed + ch.arrived, kind: 'open',
+      note: 'A new version introduced the problem, or a component arrived already failing.' },
+    { label: 'Left catalog', v: -ch.departed, kind: 'contained',
+      note: 'Failing components withdrawn from the marketplace entirely.' },
+  ].filter(x => x.v !== 0 || x.kind === 'pass' || x.kind === 'contained');
+
+  host.insertAdjacentHTML('beforeend', `
+    <div class="flex items-baseline gap-3 mb-4 pb-3 border-b border-dark-border">
+      <div><div class="text-xs text-gray-500 uppercase tracking-wider">Unresolved then</div>
+        <div class="text-xl font-semibold text-gray-400 tnum mt-0.5">${_tNum(start)}</div></div>
+      <svg width="22" height="12" class="self-end mb-1.5" aria-hidden="true"><path d="M0,6 L16,6 M11,2 L16,6 L11,10" fill="none" stroke="${_tCSS('--viz-muted')}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div><div class="text-xs text-gray-500 uppercase tracking-wider">Unresolved now</div>
+        <div class="text-xl font-semibold text-white tnum mt-0.5">${_tNum(end)}</div></div>
+      <div class="ml-auto text-right"><div class="text-xs text-gray-500 uppercase tracking-wider">Net</div>
+        <div class="text-xl font-semibold tnum mt-0.5">${_tDelta(end - start, false)}</div></div>
+    </div>`);
+
+  const GUT = 48, rowH = 46;
+  const H = steps.length * rowH + 26, zeroX = W / 2;
+  const maxAbs = Math.max(1, ...steps.map(x => Math.abs(x.v)));
+  const scale = ((W / 2) - GUT) / maxAbs;
+
+  const svg = _tEl('svg', { width: W, height: H, class: 'viz-svg', role: 'img',
+    'aria-label': 'Forces that moved the unresolved-failure count: improvements left of the zero line, regressions right' });
+  const defs = _tEl('defs');
+  defs.innerHTML = `<pattern id="tWfHatch" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+    <rect width="6" height="6" fill="#333b47"/><line x1="0" y1="0" x2="0" y2="6" stroke="#7b8494" stroke-width="2"/></pattern>`;
+  svg.appendChild(defs);
+  const fillOf = k => k === 'pass' ? _tCSS('--pass') : k === 'contained' ? _tCSS('--contained') : k === 'open' ? _tCSS('--open') : 'url(#tWfHatch)';
+  const inkOf = k => k === 'pass' ? _tCSS('--pass') : k === 'contained' ? _tCSS('--contained') : k === 'open' ? _tCSS('--open') : _tCSS('--viz-ink');
+
+  steps.forEach((x, i) => {
+    const y = i * rowH + 6;
+    const lt = _tEl('text', { x: 0, y: y + 10, fill: _tCSS('--viz-ink'), 'font-size': '11' });
+    lt.textContent = x.label; svg.appendChild(lt);
+
+    const w = Math.abs(x.v) * scale;
+    const bx = x.v < 0 ? zeroX - w : zeroX;
+    const bar = _tEl('rect', { x: bx, y: y + 18, width: Math.max(w, 2), height: 14, rx: 4, fill: fillOf(x.kind), style: 'cursor:help' });
+    bar.addEventListener('mousemove', e => _tShowTip(
+      `<div class="v" style="font-weight:600">${x.label}</div><div class="k" style="max-width:235px;margin-top:3px">${x.note}</div>
+       <div style="margin-top:5px" class="k">Effect on open failures <span class="v">${x.v > 0 ? '+' : x.v < 0 ? '−' : '±'}${_tNum(Math.abs(x.v))}</span></div>`,
+      e.clientX, e.clientY));
+    bar.addEventListener('mouseleave', _tHideTip);
+    svg.appendChild(bar);
+
+    // Values live in the reserved gutter, so they can never run off the canvas.
+    const vt = _tEl('text', { x: x.v < 0 ? bx - 7 : bx + Math.max(w, 2) + 7, y: y + 29,
+      'text-anchor': x.v < 0 ? 'end' : 'start', fill: inkOf(x.kind), 'font-size': '11', 'font-weight': '600', class: 'tnum' });
+    vt.textContent = (x.v > 0 ? '+' : x.v < 0 ? '−' : '±') + _tNum(Math.abs(x.v));
+    svg.appendChild(vt);
+  });
+
+  svg.appendChild(_tEl('line', { x1: zeroX, x2: zeroX, y1: 2, y2: steps.length * rowH + 2, stroke: _tCSS('--viz-axis'), 'stroke-width': '1' }));
+  const cl = _tEl('text', { x: zeroX - 8, y: H - 4, 'text-anchor': 'end', fill: _tCSS('--viz-muted'), 'font-size': '10' });
+  cl.textContent = '← fewer unresolved'; svg.appendChild(cl);
+  const cr = _tEl('text', { x: zeroX + 8, y: H - 4, fill: _tCSS('--viz-muted'), 'font-size': '10' });
+  cr.textContent = 'more unresolved →'; svg.appendChild(cr);
+  host.appendChild(svg);
+
+  const resolved = ch.fixed + ch.deprecated;
+  host.insertAdjacentHTML('beforeend', `
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs mb-2 mt-3">
+      <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm" style="background:var(--pass)"></span><span class="text-gray-400">Fixed</span></span>
+      <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm" style="background:var(--contained)"></span><span class="text-gray-400">Deprecated / withdrawn</span></span>
+      <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm" style="background:var(--open)"></span><span class="text-gray-400">Newly failing</span></span>
+      <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-sm" style="background:#333b47;background-image:repeating-linear-gradient(45deg,#7b8494 0 2px,transparent 2px 6px)"></span><span class="text-gray-400">Not the ecosystem</span></span>
+    </div>
+    <p class="text-xs text-gray-500 leading-relaxed border-t border-dark-border pt-3">
+      ${resolved
+        ? `<span class="text-gray-300 font-medium tnum">${_tNum(resolved)}</span> resolved by maintainers —
+           <span class="tnum" style="color:${_tCSS('--pass')}">${_tNum(ch.fixed)} fixed</span>,
+           <span class="tnum" style="color:${_tCSS('--contained')}">${_tNum(ch.deprecated)} deprecated</span>.`
+        : 'No maintainer resolutions in this window.'}
+      ${ch.reclassified
+        ? ` A scanner-rule change moved a further <span class="tnum text-gray-400">${_tNum(Math.abs(ch.reclassified))}</span> — excluded from that figure.`
+        : ''}
+    </p>`);
+}
+
+function _tRenderMovers() {
+  const host = document.getElementById('t-movers');
+  if (!host) return;
+  const c = _tCrit(), kind = TREND.state.movers;
+  const meta = {
+    fixed:        { col: _tCSS('--pass'),      icon: '↑', verb: `now passes ${c.short}`, word: 'Fixed' },
+    deprecated:   { col: _tCSS('--contained'), icon: '⊘', verb: `deprecated — still fails ${c.short}`, word: 'Deprecated' },
+    regressed:    { col: _tCSS('--open'),      icon: '↓', verb: `now fails ${c.short}`, word: 'Newly failing' },
+    reclassified: { col: _tCSS('--viz-ink'),   icon: '≈', verb: 'verdict changed, version did not', word: 'Reclassified' },
+  }[kind];
+  const { movers, omitted } = _tMovers(c.key, kind);
+  const span = _tPeriodSpanDays();
+  document.getElementById('t-movers-sub').textContent = `Components whose ${c.label} status changed — last ${span} day${span === 1 ? '' : 's'}`;
+
+  if (!movers.length) {
+    host.innerHTML = `<p class="px-5 py-10 text-sm text-gray-500 text-center">No ${meta.word.toLowerCase()} components in this window.</p>`;
+    return;
+  }
+  const badge = s => `<span class="inline-block px-1.5 py-0.5 border text-xs rounded ${s === 'Platform' ? 'bg-blue-500/10 text-blue-400 border-blue-500/20' : 'bg-gray-500/10 text-gray-400 border-gray-500/20'}">${esc(s)}</span>`;
+  host.innerHTML = `
+    <table class="viz-table min-w-full"><tbody class="divide-y divide-dark-border">
+      ${movers.slice(0, 12).map(m => `
+        <tr class="hover:bg-dark-hover cursor-pointer transition-colors" onclick="navigateTo('component', '${esc(m.id)}')">
+          <td class="pl-5 pr-2 py-2.5 w-6"><span style="color:${meta.col}" title="${meta.word}">${meta.icon}</span></td>
+          <td class="px-2 py-2.5">
+            <div class="text-sm font-medium text-white">${esc(m.name)}</div>
+            <div class="flex items-center gap-1.5 mt-1">${badge(m.s)}<span class="text-xs text-gray-500">${esc(m.c)} · ${esc(m.pub || '')}</span></div>
+          </td>
+          <td class="px-2 py-2.5"><span class="inline-block px-1.5 py-0.5 border text-xs rounded"
+            style="color:${meta.col};border-color:${meta.col}33;background:${meta.col}14">${meta.verb}</span></td>
+          <td class="px-2 py-2.5 text-right whitespace-nowrap"><div class="text-sm text-gray-300 tnum">${_tNum(m.dl)}</div><div class="text-xs text-gray-500">downloads</div></td>
+          <td class="pr-5 pl-2 py-2.5 text-right text-xs text-gray-500 whitespace-nowrap">${_tDate(m.when)}</td>
+        </tr>`).join('')}
+    </tbody></table>
+    <p class="px-5 py-3 text-xs text-gray-600 border-t border-dark-border">
+      ${movers.length > 12 ? `Showing 12 of ${_tNum(movers.length)}. ` : ''}
+      ${kind === 'deprecated' ? 'Deprecation counts as resolved — the component still fails, but it is no longer offered to customers.'
+        : kind === 'reclassified' ? 'These flipped without a new published version, so the change came from our scanner, not the marketplace.'
+        : kind === 'fixed' ? 'A newly published version cleared the criterion.'
+        : 'Arrived failing, or a new version introduced the problem.'}
+      ${omitted ? ` ${_tNum(omitted)} further transition${omitted === 1 ? ' was' : 's were'} recorded in aggregate but not listed individually.` : ''}
+    </p>`;
+}
+
+// Components that fail the selected criterion right now, ranked by reach, so the
+// list answers "who do I chase first". Component-level (from the live database)
+// rather than from the rollups, which only carry counts — and it follows the
+// criterion and both filters like everything else on the page.
+function _tUnresolvedComponents() {
+  if (!dbLayer) return [];
+  const key = _tCrit().key;
+  const { content, support } = TREND.state;
+  return dbLayer.getComponents()
+    .filter(c => {
+      if (c.support_type === 'Deprecated') return false;                   // contained, not open
+      if (content.length && !content.includes(c.content_type || 'Unknown')) return false;
+      if (support.length && !support.includes(c.support_type || 'Unknown')) return false;
+      const fs = componentFacetStatus(c)[key];
+      return fs && fs.status === 'breaking';
+    })
+    .sort((a, b) => (b.download_count || 0) - (a.download_count || 0));
+}
+
+// Does this component advertise Mendix 11 support? Mirrors facets.DeclaresMx11:
+// a failure here is broken NOW, not a future upgrade blocker.
+function _tDeclaresMx11(c) {
+  const major = parseInt((c.min_mx_version || '').split('.')[0]) || 0;
+  return major >= 11 || !!c.react_client_ready;
+}
+
+function _tRenderWorst() {
+  const host = document.getElementById('t-worst');
+  if (!host) return;
+  const c = _tCrit(), list = _tUnresolvedComponents();
+  document.getElementById('t-worst-sub').innerHTML =
+    `Still published and failing <span class="text-gray-400">${esc(c.label)}</span>, ranked by downloads`;
+  if (!list.length) {
+    host.innerHTML = '<p class="px-5 py-10 text-sm text-gray-500 text-center">Nothing unresolved in this scope.</p>';
+    return;
+  }
+  host.innerHTML = `
+    <table class="viz-table min-w-full"><tbody class="divide-y divide-dark-border">
+      ${list.slice(0, 10).map(m => {
+        const claims = _tDeclaresMx11(m);
+        const tag = claims
+          ? `<span class="inline-block px-1.5 py-0.5 border text-xs rounded whitespace-nowrap" style="color:${_tCSS('--open')};border-color:${_tCSS('--open')}33;background:${_tCSS('--open')}14" title="Advertises Mendix 11 support and fails anyway">broken on Mx11</span>`
+          : `<span class="inline-block px-1.5 py-0.5 border text-xs rounded whitespace-nowrap" style="color:${_tCSS('--possible')};border-color:${_tCSS('--possible')}33;background:${_tCSS('--possible')}14" title="Supports only Mendix 10 or older; adopting it now blocks a later upgrade">blocks upgrade</span>`;
+        return `<tr class="hover:bg-dark-hover cursor-pointer transition-colors" onclick="navigateTo('component', '${esc(m.marketplace_id)}')">
+          <td class="pl-5 pr-2 py-2.5">
+            <div class="text-sm font-medium text-white">${esc(m.name)}</div>
+            <div class="flex items-center gap-1.5 mt-1">${supportBadge(m.support_type)}<span class="text-xs text-gray-500">${esc(m.content_type || '')}${m.publisher ? ' · ' + esc(m.publisher) : ''}</span></div>
+          </td>
+          <td class="px-2 py-2.5">${tag}</td>
+          <td class="pr-5 pl-2 py-2.5 text-right whitespace-nowrap">
+            <div class="text-sm text-gray-300 tnum">${_tNum(m.download_count || 0)}</div>
+            <div class="text-xs text-gray-500">downloads</div>
+          </td>
+        </tr>`;
+      }).join('')}
+    </tbody></table>
+    <p class="px-5 py-3 text-xs text-gray-600 border-t border-dark-border">
+      Showing ${Math.min(10, list.length)} of <span class="tnum">${_tNum(list.length)}</span>.
+      Click through for the findings behind each verdict.</p>`;
+}
+
+// Which content-type × support-type segments carry the failures, as a rate not
+// just a count — a segment of 24 components with 24 failures matters more than
+// one of 800 with 60. Clicking a row scopes the whole dashboard to it.
+function _tRenderConcentration() {
+  const host = document.getElementById('t-conc');
+  if (!host) return;
+  const c = _tCrit(), s = _tSeries(c.key), last = TREND.snapshots[TREND.snapshots.length - 1];
+  const ci = TREND.criteria.findIndex(x => x.key === c.key);
+  const allow = _tAllowedSegments();
+  document.getElementById('t-conc-sub').innerHTML =
+    `Share of each segment failing <span class="text-gray-400">${esc(c.short)}</span> and still published`;
+
+  const rows = [];
+  for (const r of last.rows) {
+    if (r[0] !== ci || !allow[r[1]]) continue;
+    const applicable = r[2] - r[7];
+    if (applicable <= 0 || r[5] <= 0) continue;
+    rows.push({ seg: TREND.segments[r[1]], applicable, open: r[5], rate: r[5] / applicable });
+  }
+  if (!rows.length) {
+    host.innerHTML = '<p class="px-5 py-10 text-sm text-gray-500 text-center">Nothing unresolved in this scope.</p>';
+    return;
+  }
+  // Rank by how many are unresolved, not by rate: a segment of 2 components
+  // with 2 failures is 100% and tells you nothing, while 60 failures out of 800
+  // is where the work actually is. The bar still shows the rate as context.
+  rows.sort((a, b) => b.open - a.open || b.rate - a.rate);
+  const shown = rows.slice(0, 8);
+  host.innerHTML = `
+    <table class="viz-table min-w-full"><tbody class="divide-y divide-dark-border">
+      ${shown.map(r => `
+        <tr class="hover:bg-dark-hover cursor-pointer" data-content="${esc(r.seg[0])}" data-support="${esc(r.seg[1])}"
+            title="Scope the dashboard to ${esc(r.seg[0])} · ${esc(r.seg[1])}">
+          <td class="pl-5 pr-2 py-2.5">
+            <div class="text-sm text-white">${esc(r.seg[0])}</div>
+            <div class="text-xs text-gray-500">${esc(r.seg[1])}</div>
+          </td>
+          <td class="px-2 py-2.5 w-20">
+            <div class="h-2 rounded-sm overflow-hidden" style="background:#ffffff0d">
+              <div class="h-full" style="width:${(r.rate * 100).toFixed(1)}%;background:${_tCSS('--open')}"></div>
+            </div>
+          </td>
+          <td class="pr-5 pl-2 py-2.5 text-right whitespace-nowrap">
+            <div class="text-sm text-white tnum">${(r.rate * 100).toFixed(0)}%</div>
+            <div class="text-xs text-gray-500 tnum">${_tNum(r.open)} of ${_tNum(r.applicable)}</div>
+          </td>
+        </tr>`).join('')}
+    </tbody></table>
+    ${rows.length > shown.length ? `<p class="px-5 py-3 text-xs text-gray-600 border-t border-dark-border">Showing the ${shown.length} largest of ${rows.length} segments. Click a row to scope to it.</p>` : '<p class="px-5 py-3 text-xs text-gray-600 border-t border-dark-border">Click a row to scope the dashboard to it.</p>'}`;
+  host.querySelectorAll('[data-content]').forEach(n => n.addEventListener('click', () => {
+    TREND.state.content = [n.dataset.content];
+    TREND.state.support = [n.dataset.support];
+    _tSeriesCache.clear(); _tRedrawCombos(); _tRender();
+  }));
+}
+
+// Multi-select combobox mirroring the Components-view filters. Option counts are
+// live against the OTHER filter, so a choice's yield is visible before making it.
+function _tCombo(hostId, key, options) {
+  const host = document.getElementById(hostId);
+  if (!host) return;
+  const other = key === 'content' ? 'support' : 'content';
+  const dim = key === 'content' ? 0 : 1, otherDim = key === 'content' ? 1 : 0;
+  const allLabel = key === 'content' ? 'All content types' : 'All support types';
+  const last = TREND.snapshots[TREND.snapshots.length - 1];
+
+  const countFor = opt => {
+    let n = 0;
+    TREND.segments.forEach((seg, si) => {
+      if (seg[dim] !== opt) return;
+      if (TREND.state[other].length && !TREND.state[other].includes(seg[otherDim])) return;
+      for (const r of last.rows) if (r[0] === 0 && r[1] === si) n += r[2];
+    });
+    return n;
+  };
+  const label = () => {
+    const sel = TREND.state[key];
+    return !sel.length ? allLabel : sel.length === 1 ? sel[0] : `${sel.length} selected`;
+  };
+  host.dataset.combo = key;
+  host.dataset.open = host.dataset.open || '0';
+  host._draw = () => {
+    const open = host.dataset.open === '1';
+    host.innerHTML = `
+      <div class="relative">
+        <button class="combo-btn ${TREND.state[key].length ? 'active' : ''}" data-toggle>
+          <span>${esc(label())}</span>
+          <svg class="w-3.5 h-3.5 flex-shrink-0 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 9l6 6 6-6"/></svg>
+        </button>
+        ${open ? `<div class="combo-panel">
+          <div class="flex items-center justify-between px-3 py-2 border-b border-dark-border">
+            <span class="text-xs text-gray-500 uppercase tracking-wider">${allLabel}</span>
+            <button class="text-xs text-mx-blue hover:underline" data-clear>Clear</button>
+          </div>
+          <div class="max-h-64 overflow-y-auto py-1">
+            ${options.map(o => {
+              const n = countFor(o), on = TREND.state[key].includes(o);
+              return `<label class="combo-opt ${n ? '' : 'opacity-40'}">
+                <input type="checkbox" data-opt="${esc(o)}" ${on ? 'checked' : ''} ${n ? '' : 'disabled'}>
+                <span class="flex-1">${esc(o)}</span><span class="tnum text-xs text-gray-500">${_tNum(n)}</span></label>`;
+            }).join('')}
+          </div></div>` : ''}
+      </div>`;
+    host.querySelector('[data-toggle]').addEventListener('click', e => {
+      e.stopPropagation();
+      const wasOpen = host.dataset.open === '1';
+      document.querySelectorAll('[data-combo]').forEach(h => h.dataset.open = '0');
+      host.dataset.open = wasOpen ? '0' : '1';
+      _tRedrawCombos();
+    });
+    host.querySelectorAll('[data-opt]').forEach(cb => cb.addEventListener('change', e => {
+      e.stopPropagation();
+      const v = cb.dataset.opt;
+      TREND.state[key] = cb.checked ? [...TREND.state[key], v] : TREND.state[key].filter(x => x !== v);
+      _tSeriesCache.clear();
+      _tRedrawCombos(); _tRender();
+    }));
+    const clr = host.querySelector('[data-clear]');
+    if (clr) clr.addEventListener('click', e => {
+      e.stopPropagation();
+      TREND.state[key] = [];
+      _tSeriesCache.clear();
+      _tRedrawCombos(); _tRender();
+    });
+    const panel = host.querySelector('.combo-panel');
+    if (panel) panel.addEventListener('click', e => e.stopPropagation());
+  };
+  host._draw();
+}
+function _tRedrawCombos() { document.querySelectorAll('[data-combo]').forEach(h => h._draw && h._draw()); }
+
+let _tOutsideClickBound = false;
+function _tBindOutsideClick() {
+  if (_tOutsideClickBound) return;
+  _tOutsideClickBound = true;
+  document.addEventListener('click', () => {
+    const anyOpen = [...document.querySelectorAll('[data-combo]')].some(h => h.dataset.open === '1');
+    if (anyOpen) {
+      document.querySelectorAll('[data-combo]').forEach(h => h.dataset.open = '0');
+      _tRedrawCombos();
+    }
+  });
+}
+
+function _tRender() {
+  if (!TREND.ready || !document.getElementById('t-body')) return;
+  _tSeriesCache.clear();
+  _tRenderScope();
+
+  const anySegments = _tAllowedSegments().some(Boolean);
+  const applicable = anySegments ? _tSeries(_tCrit().key)[TREND.snapshots.length - 1].applicable : 0;
+  const empty = !anySegments || applicable === 0;
+  document.getElementById('t-empty').classList.toggle('hidden', !empty);
+  document.getElementById('t-body').classList.toggle('hidden', empty);
+  if (empty) {
+    document.getElementById('t-empty-msg').innerHTML = anySegments
+      ? `<span class="text-gray-300">${esc(_tCrit().label)}</span> cannot be assessed on any component in this scope.`
+      : 'No components match this combination of content type and support type.';
+    return;
+  }
+
+  _tRenderKPIs();
+  const chart = document.getElementById('t-chart'), table = document.getElementById('t-table');
+  if (TREND.state.view === 'chart') { _tRenderChart(); chart.classList.remove('hidden'); table.classList.add('hidden'); }
+  else { _tRenderTable(); chart.classList.add('hidden'); table.classList.remove('hidden'); }
+  _tRenderCards(); _tRenderWaterfall(); _tRenderMovers(); _tRenderWorst(); _tRenderConcentration();
+}
+
+function _tMount() {
+  if (!TREND.ready) return;
+  const seg = (id, key, cast = v => v) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      [...b.parentElement.children].forEach(x => x.classList.toggle('on', x === b));
+      TREND.state[key] = cast(b.dataset.v);
+      _tRender();
+    });
+  };
+  seg('t-period', 'days', v => v === 'all' ? 'all' : Number(v));
+  seg('t-measure', 'measure');
+  seg('t-view', 'view');
+  seg('t-movers-kind', 'movers');
+  const sel = document.getElementById('t-criterion');
+  if (sel) sel.addEventListener('change', () => { TREND.state.criterion = sel.value; _tRender(); });
+  const reset = document.getElementById('t-reset');
+  if (reset) reset.addEventListener('click', () => {
+    TREND.state.content = []; TREND.state.support = [];
+    _tSeriesCache.clear(); _tRedrawCombos(); _tRender();
+  });
+
+  _tCombo('t-combo-content', 'content', TREND.contentTypes);
+  _tCombo('t-combo-support', 'support', TREND.supportTypes);
+  _tBindOutsideClick();
+  _tRender();
+
+  clearTimeout(TREND._resizeTimer);
+  if (!TREND._resizeBound) {
+    TREND._resizeBound = true;
+    window.addEventListener('resize', () => {
+      clearTimeout(TREND._resizeTimer);
+      TREND._resizeTimer = setTimeout(() => { if (document.getElementById('t-body')) _tRender(); }, 150);
+    });
+  }
+}
+
+// =============================================================================
 // Dashboard
 // =============================================================================
 
-// Click-through from a dashboard facet card to the components list, pre-filtered
-// to components failing that facet.
-function gotoFacet(key) {
-  componentFilters.columnFilters = { [key]: ['breaking', 'warning'] };
-  componentFilters.contentTypes = [];
-  navigateTo('components');
-}
-
-// Roll up per-facet status counts across a set of components.
-function _facetRollup(components) {
-  const roll = {};
-  FACET_DEFS.forEach(d => roll[d.key] = { breaking: 0, warning: 0, compatible: 0, na: 0 });
-  for (const c of components) {
-    const fs = componentFacetStatus(c);
-    FACET_DEFS.forEach(d => roll[d.key][fs[d.key].status]++);
-  }
-  return roll;
-}
-
-// Facets a component is currently breaking on (used for the offenders table).
-function _breakingFacets(c) {
-  const fs = componentFacetStatus(c);
-  return FACET_DEFS.filter(d => fs[d.key].status === 'breaking');
-}
-
 function renderDashboard() {
-  const stats = dbLayer.getStats() || {};
-  const breakdown = dbLayer.getComponentBreakdown();
-  const health = dbLayer.getHealthStats();
-  const allComponents = dbLayer.getComponents();
-
-  const rollup = _facetRollup(allComponents);
-  const needAttention = allComponents.filter(c => _breakingFacets(c).length > 0);
-
-  // Top offenders by impact: prod apps first, then downloads.
-  const offenders = [...needAttention]
-    .sort((a, b) => (b.prod_apps_mx10 || 0) - (a.prod_apps_mx10 || 0) || (b.download_count || 0) - (a.download_count || 0))
-    .slice(0, 12);
-
-  // Breaking counts per support type (outreach path differs per support type).
-  const bySupport = {};
-  for (const c of allComponents) {
-    const s = c.support_type || 'Unknown';
-    (bySupport[s] || (bySupport[s] = { total: 0, breaking: 0 })).total++;
-    if (_breakingFacets(c).length > 0) bySupport[s].breaking++;
-  }
-  const supportRows = Object.entries(bySupport).sort((a, b) => b[1].breaking - a[1].breaking);
-
-  function healthStatCard(label, value, sub) {
-    const active = value > 0;
-    return `<div class="bg-dark-surface rounded-lg p-3 border ${active ? 'border-amber-500/30' : 'border-dark-border'}">
-      <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">${label}</p>
-      <p class="text-2xl font-semibold ${active ? 'text-amber-400' : 'text-gray-600'}">${value}</p>
-      <p class="text-xs text-gray-600 mt-0.5">${sub}</p>
-    </div>`;
-  }
-
-  function facetSummaryCard(d) {
-    const r = rollup[d.key];
-    return `<div onclick="gotoFacet('${d.key}')" title="Show components failing ${esc(d.full)}"
-                 class="bg-dark-surface rounded-lg p-4 border border-dark-border hover:border-blue-500/40 cursor-pointer transition-colors">
-      <p class="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">${esc(d.full)}</p>
-      <div class="flex items-end gap-4">
-        <div><div class="text-2xl font-semibold ${r.breaking > 0 ? 'text-red-400' : 'text-gray-600'}">${r.breaking}</div><div class="text-xs text-gray-500">breaking</div></div>
-        <div><div class="text-lg font-semibold ${r.warning > 0 ? 'text-amber-400' : 'text-gray-600'}">${r.warning}</div><div class="text-xs text-gray-500">possible</div></div>
-        <div class="ml-auto text-right"><div class="text-lg font-semibold text-green-400">${r.compatible}</div><div class="text-xs text-gray-500">ok</div></div>
-      </div>
-    </div>`;
-  }
-
-  const html = `
+  // Everything on this page answers to the criterion, period and filters. The
+  // old snapshot-only sections were removed rather than left below: the facet
+  // cards duplicated the criteria cards, the health tiles became criteria, the
+  // content-type table became a filter, and "top offenders" ignored the
+  // criterion entirely — which is exactly the inconsistency that made the page
+  // confusing to read.
+  document.getElementById('dashboard-view').innerHTML = `
     <div class="p-6">
-      <div class="mb-6">
+      <div class="mb-5">
         <h2 class="text-2xl font-semibold text-white">Dashboard</h2>
-        <p class="text-gray-400 text-sm mt-1">Marketplace compatibility curation — Mendix 10 → 11 → 12</p>
+        <p class="text-gray-400 text-sm mt-1">Marketplace curation — a component is <span class="text-gray-300">resolved</span> when it is fixed <em>or</em> deprecated. Both stop it blocking somebody's upgrade.</p>
       </div>
-
-      <!-- Stat cards -->
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-        ${statCard('Components', allComponents.length, 'scanned packages', 'text-white')}
-        ${statCard('Widgets', stats.total_widgets || 0, 'across all components', 'text-white')}
-        ${statCard('Modules', stats.total_modules || 0, 'Java modules', 'text-white')}
-        ${statCard('Need attention', needAttention.length, 'breaking ≥1 facet', needAttention.length > 0 ? 'text-red-400' : 'text-gray-400')}
-      </div>
-
-      <!-- Facet compatibility summary -->
-      <div class="mb-6">
-        <div class="flex items-baseline gap-2 mb-3">
-          <h3 class="text-sm font-semibold text-white">Compatibility by facet</h3>
-          <span class="text-xs text-gray-500">Click a facet to see the components failing it</span>
-        </div>
-        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
-          ${FACET_DEFS.map(facetSummaryCard).join('')}
-        </div>
-      </div>
-
-      <!-- Top offenders + by support type -->
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-        <div class="md:col-span-2">
-        ${card(`
-          <div class="px-4 py-3 border-b border-dark-border">
-            <h3 class="text-sm font-semibold text-white">Top offenders by impact</h3>
-            <p class="text-xs text-gray-500 mt-0.5">Breaking components ranked by production usage then downloads — who to reach out to first</p>
-          </div>
-          ${offenders.length === 0
-            ? '<p class="px-4 py-6 text-sm text-gray-500 text-center">No breaking components found</p>'
-            : `<table class="min-w-full"><tbody class="divide-y divide-dark-border">
-                ${offenders.map(c => `
-                  <tr class="hover:bg-dark-hover cursor-pointer transition-colors" onclick="navigateTo('component', '${c.marketplace_id}')">
-                    <td class="px-4 py-3">
-                      <div class="text-sm font-medium text-white">${esc(c.name)}</div>
-                      <div class="flex items-center gap-1 mt-1 flex-wrap">
-                        ${contentTypeBadge(c.content_type)}${supportBadge(c.support_type)}
-                        ${c.publisher ? `<span class="text-xs text-gray-500 ml-1">${esc(c.publisher)}</span>` : ''}
-                      </div>
-                    </td>
-                    <td class="px-4 py-3">
-                      <div class="flex flex-wrap gap-1 justify-end">
-                        ${_breakingFacets(c).map(d => `<span class="inline-block px-1.5 py-0.5 bg-red-500/10 text-red-400 border border-red-500/20 text-xs rounded">${d.label}</span>`).join('')}
-                      </div>
-                    </td>
-                    <td class="px-4 py-3 text-right whitespace-nowrap">
-                      ${c.prod_apps_mx10 > 0
-                        ? `<div class="text-white text-sm font-medium">${c.prod_apps_mx10.toLocaleString()}</div><div class="text-xs text-gray-500">prod apps</div>`
-                        : c.download_count > 0
-                        ? `<div class="text-gray-300 text-sm">${c.download_count.toLocaleString()}</div><div class="text-xs text-gray-500">downloads</div>`
-                        : '<span class="text-gray-600 text-xs">—</span>'}
-                    </td>
-                  </tr>`).join('')}
-              </tbody></table>`
-          }
-        `)}
-        </div>
-
-        ${card(`
-          <div class="px-4 py-3 border-b border-dark-border">
-            <h3 class="text-sm font-semibold text-white">Breaking by support type</h3>
-            <p class="text-xs text-gray-500 mt-0.5">Outreach path differs per support type</p>
-          </div>
-          <table class="min-w-full">
-            <thead class="bg-dark-bg/50"><tr>${th('Support')}${th('Breaking')}${th('Total')}</tr></thead>
-            <tbody class="divide-y divide-dark-border">
-              ${supportRows.map(([s, v]) => `
-                <tr class="hover:bg-dark-hover transition-colors">
-                  <td class="px-4 py-3">${supportBadge(s)}</td>
-                  <td class="px-4 py-3 text-sm ${v.breaking > 0 ? 'text-red-400' : 'text-gray-500'}">${v.breaking}</td>
-                  <td class="px-4 py-3 text-sm text-gray-400">${v.total}</td>
-                </tr>`).join('')}
-            </tbody>
-          </table>
-        `)}
-      </div>
-
-      <!-- Component health warnings -->
-      <div class="mb-6">
-        <div class="flex items-baseline gap-2 mb-3">
-          <h3 class="text-sm font-semibold text-white">Component Health</h3>
-          <span class="text-xs text-gray-500">Non-compatibility quality warnings (non-deprecated components)</span>
-        </div>
-        <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
-          ${healthStatCard('Not importable to Mx11', health.notImportable, 'min version < 10.21.0')}
-          ${healthStatCard('Stale', health.stale, 'last updated > 1 year ago')}
-          ${healthStatCard('Unmanaged Java deps', health.unmanagedDeps, 'JARs without managed-deps')}
-          ${healthStatCard('Starter: no React Client', health.starterNoReact, 'starter apps not RC ready')}
-          ${healthStatCard('Starter: possible mpr_v1', health.starterNoMprV2, 'min version < 9.24.0')}
-        </div>
-      </div>
-
-      <!-- Content type breakdown -->
-      ${card(`
-        <div class="px-4 py-3 border-b border-dark-border">
-          <h3 class="text-sm font-semibold text-white">By content type</h3>
-          <p class="text-xs text-gray-500 mt-0.5">Widget and module counts per type</p>
-        </div>
-        <table class="min-w-full">
-          <thead class="bg-dark-bg/50"><tr>${th('Type')}${th('Support')}${th('Components')}${th('Widgets')}${th('Modules')}</tr></thead>
-          <tbody class="divide-y divide-dark-border">
-            ${breakdown.map(b => `
-              <tr class="hover:bg-dark-hover transition-colors">
-                <td class="px-4 py-3">${contentTypeBadge(b.content_type)}</td>
-                <td class="px-4 py-3">${supportBadge(b.support_type)}</td>
-                <td class="px-4 py-3 text-sm text-gray-300">${b.component_count}</td>
-                <td class="px-4 py-3 text-sm text-gray-300">${b.widget_count}${b.breaking_widget_count > 0 ? ` <span class="text-red-400 text-xs">(${b.breaking_widget_count} breaking)</span>` : ''}</td>
-                <td class="px-4 py-3 text-sm text-gray-300">${b.module_count}${b.breaking_module_count > 0 ? ` <span class="text-red-400 text-xs">(${b.breaking_module_count} breaking)</span>` : ''}</td>
-              </tr>`).join('')}
-          </tbody>
-        </table>
-      `)}
+      ${_tSectionHTML()}
     </div>`;
-
-  document.getElementById('dashboard-view').innerHTML = html;
   showView('dashboard-view');
-}
-
-function statCard(label, value, sub, valueClass) {
-  return `
-    <div class="bg-dark-surface rounded-lg p-4 border border-dark-border">
-      <p class="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">${label}</p>
-      <p class="text-3xl font-semibold ${valueClass}">${value}</p>
-      <p class="text-xs text-gray-500 mt-1">${sub}</p>
-    </div>`;
+  // Mount after the view is visible — the SVG charts size themselves from
+  // clientWidth, which is 0 while the container is still display:none.
+  _tMount();
 }
 
 // =============================================================================
@@ -880,6 +1928,18 @@ function componentFacetStatus(c) {
     'mx12':         { status: mx12, ...dep },
     _moduleDeps:    data.moduleDeps || [],
   };
+
+  // Health criteria — the same three pkg/facets computes, so the dashboard can
+  // rank components under ANY criterion the trends offer, not just the five
+  // compatibility facets. Keys match pkg/facets.Criteria exactly; they are
+  // deliberately NOT in FACET_DEFS, so they never appear as facet columns.
+  const _na = 'na';
+  result['managed-deps'] = { status: !hasModules ? _na : ((c.unmanaged_dep_count || 0) > 0 ? 'breaking' : 'compatible'), certain: 0, uncertain: 0 };
+  result['importable'] = { status: !isModuleType || !c.min_mx_version ? _na : (notImportableTo11 ? 'breaking' : 'compatible'), certain: 0, uncertain: 0 };
+  const _lastActivity = c.last_publish_date || c.changed_date;
+  const _yearAgo = Date.now() - 365 * 24 * 3600 * 1000;
+  const _t = _lastActivity ? new Date(_lastActivity).getTime() : NaN;
+  result['maintained'] = { status: isNaN(_t) ? _na : (_t < _yearAgo ? 'breaking' : 'compatible'), certain: 0, uncertain: 0 };
 
   // Experimental facets — kept separate from the finalized ones above. A hit reads
   // as a neutral "flagged" warning; otherwise compatible when the check can apply,
