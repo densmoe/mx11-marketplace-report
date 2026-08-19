@@ -81,6 +81,8 @@ function applyHash() {
   // reproduces the exact filtered view. Non-list views leave filters untouched.
   const LIST_VIEWS = { components: 1, widgets: 1, modules: 1, 'starter-apps': 1, experiments: 1 };
   if (LIST_VIEWS[view]) _applyCompFilterParams(params);
+  // The packaging pages keep their own (much smaller) filter state.
+  if (PACKAGING_PAGES[view]) _pkgApplyParams(params);
 
   switch (view) {
     case 'dashboard':     renderDashboard(); break;
@@ -92,6 +94,9 @@ function applyHash() {
     case 'module':        id ? renderModuleDetail(id) : renderComponentCategory('modules'); break;
     case 'starter-apps':  renderComponentCategory('starter-apps'); break;
     case 'experiments':   renderComponentCategory('experiments'); break;
+    case 'addons':        renderPackagingPage('addons'); break;
+    case 'extensions':    renderPackagingPage('extensions'); break;
+    case 'solutions':     renderPackagingPage('solutions'); break;
     case 'teams':         renderTeams(); break;
     case 'issues':        renderIssues(); break;
     case 'issue':         id ? renderIssueDetail(id) : renderIssues(); break;
@@ -202,6 +207,11 @@ function initApp() {
   if (dbLayer.getDistinctTeams().length > 0) {
     const navTeams = document.getElementById('nav-teams');
     if (navTeams) navTeams.classList.remove('hidden');
+  }
+  // Reveal the packaging nav items only when the DB carries packaging analysis
+  // (databases written before it exists have no distribution_type column).
+  if (dbLayer.hasPackagingData()) {
+    document.querySelectorAll('[data-nav-packaging]').forEach(el => el.classList.remove('hidden'));
   }
   // Reveal the Experiments nav item only when the DB carries experimental findings.
   // The public (redacted) build empties those tables, so this stays hidden there.
@@ -3216,6 +3226,7 @@ function buildHeroSection(comp, widgets, modules) {
               <div class="flex items-center gap-2 flex-wrap">
                 <h2 class="text-xl font-semibold text-white">${esc(comp.name)}</h2>
                 ${contentTypeBadge(comp.content_type)}${supportBadge(comp.support_type)}
+                ${comp.distribution_type && comp.distribution_type !== 'regular' ? pkgDistBadge(comp.distribution_type) : ''}
               </div>
               ${publisherLine ? `<div class="mt-0.5 text-sm text-gray-400">by ${publisherLine}</div>` : ''}
             </div>
@@ -3768,9 +3779,14 @@ function buildStructurePanel(comp, modules, allWidgets, javaFindings, jsFindings
       </div>`);
   }
 
+  // How the package is delivered — add-on module, extension, solution — reads
+  // above the anatomy, since it decides what the anatomy means.
+  const packagingCard = buildPackagingCard(comp, dbLayer.getPackagingModules(comp.id));
+
   return `
     <div class="space-y-4">
       ${versionNote}
+      ${packagingCard}
       ${structureSection}
       ${depsCard}
       ${modSummary}
@@ -5485,4 +5501,605 @@ function renderIssueDetail(issueId) {
 
   document.getElementById('issue-detail-view').innerHTML = html;
   showView('issue-detail-view');
+}
+
+// =============================================================================
+// Packaging — add-on modules, Studio Pro extensions and solutions
+// =============================================================================
+//
+// Three pages over the same rows, split by how a component is delivered. The
+// classification is computed during the scan (pkg/modules/packaging.go) and
+// stored on components.distribution_type; the helpers here only present it.
+//
+// The vocabulary, since the Marketplace listing says none of it:
+//   • add-on module      — model ships Protected: consumers can call it but not
+//                          open it. Exported as .mxmodule.
+//   • Studio Pro extension — an IDE plugin (extensions/<name>/). Mendix packages
+//                          these *as* add-on modules, so most add-ons are these.
+//   • solution           — a whole app sold to customers, exported .mxsolution;
+//                          "solution module" is the module type used inside one.
+
+// Module kind → badge. Mirrors ModuleSettingsInfo.Kind() in
+// pkg/modules/packaging.go — change one, change the other.
+const PKG_KIND_META = {
+  'add-on':     { label: 'Add-on',     cls: 'bg-purple-500/15 text-purple-300 border-purple-500/30' },
+  'solution':   { label: 'Solution',   cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
+  'app-module': { label: 'App module', cls: 'bg-gray-600/20 text-gray-400 border-gray-600/40' },
+};
+
+const PKG_DIST_META = {
+  'add-on':           { label: 'Add-on module',       cls: 'bg-purple-500/15 text-purple-300 border-purple-500/30' },
+  'add-on-extension': { label: 'Add-on + extension',  cls: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30' },
+  'extension-source': { label: 'Extension, unprotected', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/30' },
+  'solution':         { label: 'Solution package',    cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
+  'regular':          { label: 'Regular module/app',  cls: 'bg-gray-600/20 text-gray-400 border-gray-600/40' },
+};
+
+const PKG_FORMAT_META = {
+  mxmodule:   { label: '.mxmodule',   cls: 'bg-purple-500/15 text-purple-300 border-purple-500/30' },
+  mxsolution: { label: '.mxsolution', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' },
+  mpk:        { label: '.mpk',        cls: 'bg-gray-600/20 text-gray-400 border-gray-600/40' },
+};
+
+// Kind of a single module's export settings. Must agree with the Go side.
+function _pkgModuleKind(s) {
+  if (s.protected_module_type === 'Solution') return 'solution';
+  if (s.export_level === 'Protected') return 'add-on';
+  return 'app-module';
+}
+
+function pkgKindBadge(kind) {
+  const m = PKG_KIND_META[kind] || PKG_KIND_META['app-module'];
+  return `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium border ${m.cls}">${m.label}</span>`;
+}
+
+function pkgDistBadge(dist) {
+  const m = PKG_DIST_META[dist] || PKG_DIST_META['regular'];
+  return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${m.cls}">${m.label}</span>`;
+}
+
+function pkgFormatBadge(format, fileName) {
+  if (!format) return '<span class="text-gray-600">—</span>';
+  const m = PKG_FORMAT_META[format] || { label: '.' + format, cls: PKG_FORMAT_META.mpk.cls };
+  const title = fileName ? ` title="${esc(fileName)}"` : '';
+  return `<span${title} class="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-mono border ${m.cls}">${m.label}</span>`;
+}
+
+function fmtBytes(n) {
+  const b = Number(n) || 0;
+  if (b >= 1024 * 1024 * 1024) return (b / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+  if (b >= 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + ' MB';
+  if (b >= 1024) return Math.round(b / 1024) + ' KB';
+  return b + ' B';
+}
+
+// ---------------------------------------------------------------------------
+// Row model
+// ---------------------------------------------------------------------------
+
+let _pkgRowCache = null;
+
+// One row per component with a packaging signal, with its modules' export
+// settings flattened and de-duplicated (a component can ship several packages,
+// and a bundled add-on appears once per package that carries it).
+function packagingRows() {
+  if (_pkgRowCache) return _pkgRowCache;
+  const comps = dbLayer.getPackagingComponents();
+  const byComp = {};
+  for (const m of dbLayer.getPackagingModules()) (byComp[m.component_id] = byComp[m.component_id] || []).push(m);
+
+  _pkgRowCache = comps.map(c => {
+    const mods = byComp[c.id] || [];
+    const seen = new Set();
+    const settings = [];
+    const nested = [];
+    for (const m of mods) {
+      for (const s of _parseJSON(m.package_modules_json)) {
+        const key = (s.name || '?') + '\x1f' + (s.source || '');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        settings.push(Object.assign({ package: m.name, kind: _pkgModuleKind(s) }, s));
+      }
+      for (const n of _parseJSON(m.nested_packages_json)) nested.push(n);
+    }
+    const extensions = _parseJSON(c.extension_names_json);
+    return {
+      id: c.id,
+      marketplaceId: c.marketplace_id,
+      name: c.name,
+      publisher: c.publisher || '',
+      support: c.support_type || '',
+      contentType: c.content_type || '',
+      minMx: c.min_mx_version || '',
+      downloads: c.download_count || 0,
+      lastPublish: c.last_publish_date || '',
+      permalink: c.permalink || '',
+      team: c.owning_team || '',
+      dist: c.distribution_type || 'regular',
+      packageFile: c.package_file_name || '',
+      packageFormat: c.package_format || '',
+      developers: parseDevelopers(c.developers_json).map(d => d.name).filter(Boolean),
+      settings,
+      nested,
+      extensions,
+      addOnModules: settings.filter(s => s.kind === 'add-on'),
+      solutionModules: settings.filter(s => s.kind === 'solution'),
+      moduleCount: settings.length,
+    };
+  });
+  return _pkgRowCache;
+}
+
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+const PACKAGING_PAGES = {
+  addons: {
+    viewId: 'addons-view',
+    title: 'Add-on Modules',
+    lead: 'Components that ship at least one IP-protected module',
+    blurb: `An <strong>add-on module</strong> ships with its model compiled: consumers can call the elements
+      marked <em>Usable</em>, but cannot open or edit them. That is what "IP protection" means in the artifact,
+      and it is recorded as <code class="text-gray-300">ExportLevel = Protected</code> in Module Settings.
+      Note that the <em>module type</em> field alone cannot be trusted — it stores "AddOn" by default on
+      ordinary app modules too.`,
+    // The bucket decides the badge, but a component that ships a protected module
+    // belongs here even when its bucket says something else (a solution package
+    // that also bundles add-ons, say).
+    match: r => r.dist === 'add-on' || r.dist === 'add-on-extension' || r.addOnModules.length > 0,
+    metric: r => r.addOnModules.length,
+    metricLabel: 'Add-on modules',
+  },
+  extensions: {
+    viewId: 'extensions-view',
+    title: 'Studio Pro Extensions',
+    lead: 'Components shipping an IDE extension (extensions/<name>)',
+    blurb: `A <strong>Studio Pro extension</strong> is a plugin for the IDE itself, not app functionality.
+      Mendix's documented way to distribute one is to package it <em>as an add-on module</em>, so extension
+      delivery rides on the same mechanism — deprecating add-on modules takes this path with it.
+      A few components ship an extension inside an ordinary source module instead, which is possible but
+      unprotected.`,
+    match: r => r.extensions.length > 0,
+    metric: r => r.extensions.length,
+    metricLabel: 'Extensions',
+  },
+  solutions: {
+    viewId: 'solutions-view',
+    title: 'Solutions',
+    lead: 'Solution packages (.mxsolution) and components declaring solution modules',
+    blurb: `A <strong>solution</strong> is a whole app sold to multiple customers, exported as
+      <code class="text-gray-300">.mxsolution</code>; a <strong>solution module</strong> is the module type
+      used inside one. This is unrelated to the Marketplace's own "Solution" content type, which is a listing
+      category — the one real <code class="text-gray-300">.mxsolution</code> in the Marketplace is filed
+      under "Sample".`,
+    match: r => r.dist === 'solution' || r.solutionModules.length > 0,
+    metric: r => r.solutionModules.length,
+    metricLabel: 'Solution modules',
+  },
+};
+
+// Filter/sort state, shared by the three pages and mirrored into the URL so a
+// filtered view can be pasted to someone else.
+let _pkgFilters = { q: '', support: [], sort: 'downloads' };
+let _pkgPage = 'addons';
+
+function _pkgSyncURL() {
+  const params = {};
+  if (_pkgFilters.q.trim()) params.q = _pkgFilters.q.trim();
+  if (_pkgFilters.support.length) params.support = _pkgFilters.support.join(',');
+  if (_pkgFilters.sort !== 'downloads') params.sort = _pkgFilters.sort;
+  history.replaceState(null, '', '#' + buildHash({ view: _pkgPage, params }));
+}
+
+function _pkgApplyParams(params) {
+  _pkgFilters.q = params.q || '';
+  _pkgFilters.support = params.support ? params.support.split(',').filter(Boolean) : [];
+  _pkgFilters.sort = params.sort || 'downloads';
+}
+
+function setPackagingSearch(v) {
+  _pkgFilters.q = v;
+  _pkgSyncURL();
+  _pkgRenderResults();
+}
+
+function togglePackagingSupport(v) {
+  const i = _pkgFilters.support.indexOf(v);
+  if (i >= 0) _pkgFilters.support.splice(i, 1); else _pkgFilters.support.push(v);
+  _pkgSyncURL();
+  renderPackagingPage(_pkgPage);
+}
+
+function setPackagingSort(v) {
+  _pkgFilters.sort = v;
+  _pkgSyncURL();
+  renderPackagingPage(_pkgPage);
+}
+
+function clearPackagingFilters() {
+  _pkgFilters = { q: '', support: [], sort: 'downloads' };
+  _pkgSyncURL();
+  renderPackagingPage(_pkgPage);
+}
+
+function _pkgFiltered(pageKey) {
+  const page = PACKAGING_PAGES[pageKey];
+  const q = _pkgFilters.q.trim().toLowerCase();
+  let rows = packagingRows().filter(page.match);
+  if (_pkgFilters.support.length) rows = rows.filter(r => _pkgFilters.support.includes(r.support));
+  if (q) {
+    rows = rows.filter(r =>
+      r.name.toLowerCase().includes(q) ||
+      r.publisher.toLowerCase().includes(q) ||
+      r.marketplaceId.includes(q) ||
+      r.extensions.some(e => e.toLowerCase().includes(q)) ||
+      r.settings.some(s => (s.name || '').toLowerCase().includes(q)));
+  }
+  const sorters = {
+    downloads: (a, b) => b.downloads - a.downloads,
+    name: (a, b) => a.name.localeCompare(b.name),
+    publisher: (a, b) => a.publisher.localeCompare(b.publisher) || b.downloads - a.downloads,
+    published: (a, b) => (b.lastPublish || '').localeCompare(a.lastPublish || ''),
+    minmx: (a, b) => dbLayer.compareVersions(a.minMx, b.minMx) || b.downloads - a.downloads,
+  };
+  return rows.slice().sort(sorters[_pkgFilters.sort] || sorters.downloads);
+}
+
+function renderAddons()     { renderPackagingPage('addons'); }
+function renderExtensions() { renderPackagingPage('extensions'); }
+function renderSolutions()  { renderPackagingPage('solutions'); }
+
+function renderPackagingPage(pageKey) {
+  const page = PACKAGING_PAGES[pageKey];
+  _pkgPage = pageKey;
+
+  if (!dbLayer.hasPackagingData()) {
+    document.getElementById(page.viewId).innerHTML = `
+      <div class="p-6">
+        <h2 class="text-2xl font-semibold text-white">${page.title}</h2>
+        <div class="text-center py-10 text-gray-500 text-sm">
+          This report predates packaging analysis. Re-run the scan to populate it.
+        </div>
+      </div>`;
+    showView(page.viewId);
+    return;
+  }
+
+  const all = packagingRows().filter(page.match);
+  const rows = _pkgFiltered(pageKey);
+  const supportTypes = [...new Set(all.map(r => r.support).filter(Boolean))].sort();
+
+  const kpi = (label, value, sub) => `
+    <div class="bg-dark-surface border border-dark-border rounded-lg p-4">
+      <div class="text-2xl font-semibold text-white">${value}</div>
+      <div class="text-xs text-gray-400 mt-1">${label}</div>
+      ${sub ? `<div class="text-[11px] text-gray-500 mt-1">${sub}</div>` : ''}
+    </div>`;
+
+  const totalDownloads = all.reduce((s, r) => s + r.downloads, 0);
+  const publishers = new Set(all.map(r => r.publisher).filter(Boolean));
+  const external = new Set(all.filter(r => !['Mendix', 'Siemens'].includes(r.publisher)).map(r => r.publisher).filter(Boolean));
+  const unitCount = all.reduce((s, r) => s + page.metric(r), 0);
+
+  const kpis = `
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+      ${kpi('Components', all.length, `<span id="packaging-shown-count">${rows.length !== all.length ? `${rows.length} shown` : ''}</span>`)}
+      ${kpi(page.metricLabel, unitCount, '')}
+      ${kpi('Downloads', totalDownloads.toLocaleString(), 'across these components')}
+      ${kpi('Publishers', publishers.size, `${external.size} outside Mendix/Siemens`)}
+    </div>`;
+
+  const supportChips = supportTypes.map(s => {
+    const on = _pkgFilters.support.includes(s);
+    return `<button onclick="togglePackagingSupport(${jsStr(s)})"
+      class="px-2.5 py-1 rounded-md text-xs border transition-colors ${on
+        ? 'bg-mx-blue/20 border-mx-blue/50 text-white'
+        : 'bg-dark-bg/40 border-dark-border text-gray-400 hover:text-gray-200'}">${esc(s)}</button>`;
+  }).join('');
+
+  const anyFilter = _pkgFilters.q.trim() || _pkgFilters.support.length || _pkgFilters.sort !== 'downloads';
+
+  const filterBar = `
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+      <input type="search" value="${esc(_pkgFilters.q)}" oninput="setPackagingSearch(this.value)"
+        placeholder="Search component, publisher, module or extension…"
+        class="flex-1 min-w-[240px] bg-dark-surface border border-dark-border rounded-md px-3 py-1.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-mx-blue/50">
+      ${supportChips}
+      <select onchange="setPackagingSort(this.value)"
+        class="bg-dark-surface border border-dark-border rounded-md px-2 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-mx-blue/50">
+        <option value="downloads" ${_pkgFilters.sort === 'downloads' ? 'selected' : ''}>Most downloaded</option>
+        <option value="name"      ${_pkgFilters.sort === 'name' ? 'selected' : ''}>Name</option>
+        <option value="publisher" ${_pkgFilters.sort === 'publisher' ? 'selected' : ''}>Publisher</option>
+        <option value="published" ${_pkgFilters.sort === 'published' ? 'selected' : ''}>Last published</option>
+        <option value="minmx"     ${_pkgFilters.sort === 'minmx' ? 'selected' : ''}>Minimum Mendix version</option>
+      </select>
+      <button onclick="exportPackagingCSV('${pageKey}')"
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm border border-dark-border bg-dark-bg/40 text-gray-200 hover:text-white hover:border-mx-blue/50 transition-colors">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>
+        Export CSV
+      </button>
+      ${anyFilter ? `<button onclick="clearPackagingFilters()" class="px-2.5 py-1 rounded-md text-xs border border-dark-border text-gray-400 hover:text-gray-200">Clear</button>` : ''}
+    </div>`;
+
+  const body = _pkgTableHTML(pageKey, rows);
+
+  document.getElementById(page.viewId).innerHTML = `
+    <div class="p-6">
+      <div class="mb-4">
+        <h2 class="text-2xl font-semibold text-white">${page.title}</h2>
+        <p class="text-gray-400 text-sm mt-1">${esc(page.lead)} · ${all.length} component${all.length !== 1 ? 's' : ''}</p>
+      </div>
+      <div class="mb-5 flex items-start gap-3 rounded-lg border border-mx-blue/20 bg-mx-blue/5 p-4">
+        <svg class="w-5 h-5 flex-shrink-0 text-mx-blue mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        <div class="text-sm text-gray-300 leading-relaxed">${page.blurb}</div>
+      </div>
+      ${kpis}
+      ${filterBar}
+      <div id="packaging-results">${body}</div>
+    </div>`;
+  showView(page.viewId);
+}
+
+// The column that carries what each page is actually about.
+const _PKG_FOCUS_LABEL = {
+  addons: 'Protected modules',
+  extensions: 'Extensions',
+  solutions: 'Solution modules',
+};
+
+// The results table. The "focus" column shows what the page is about: the
+// extensions it ships, the solution modules it declares, or the protected
+// modules behind the classification.
+function _pkgTableHTML(pageKey, rows) {
+  if (rows.length === 0) {
+    return `<div class="text-center py-10 text-gray-500 text-sm">No components match these filters.</div>`;
+  }
+  return card(`
+    <table class="min-w-full">
+      <thead class="bg-dark-bg/50"><tr>
+        ${th('Component')}${th('Publisher')}${th('Support')}${th('Delivery')}
+        ${th(_PKG_FOCUS_LABEL[pageKey] || 'Protected modules')}
+        ${th('Package file')}${th('Min Mx')}${th('Downloads')}${th('Last published')}
+      </tr></thead>
+      <tbody class="divide-y divide-dark-border">${rows.map(r => _pkgRow(r, pageKey)).join('')}</tbody>
+    </table>`);
+}
+
+// Re-render only the table after a keystroke, so the search box keeps focus.
+function _pkgRenderResults() {
+  const host = document.getElementById('packaging-results');
+  if (!host) return;
+  host.innerHTML = _pkgTableHTML(_pkgPage, _pkgFiltered(_pkgPage));
+  const count = document.getElementById('packaging-shown-count');
+  if (count) {
+    const total = packagingRows().filter(PACKAGING_PAGES[_pkgPage].match).length;
+    const shown = _pkgFiltered(_pkgPage).length;
+    count.textContent = shown === total ? '' : `${shown} shown`;
+  }
+}
+
+function _pkgRow(r, pageKey) {
+  const href = '#' + buildHash({ view: 'component', id: r.marketplaceId, params: { selectedTab: 'structure' } });
+
+  const focus = pageKey === 'extensions'
+    ? (r.extensions.length
+        ? r.extensions.map(e => `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-mono bg-dark-bg/60 border border-dark-border text-gray-300">${esc(e)}</span>`).join(' ')
+        : '<span class="text-gray-600">—</span>')
+    : (() => {
+        const list = pageKey === 'solutions'
+          ? (r.solutionModules.length ? r.solutionModules : r.addOnModules)
+          : r.addOnModules;
+        if (!list.length) return '<span class="text-gray-600">—</span>';
+        const shown = list.slice(0, 3).map(s =>
+          `<span class="text-gray-200">${esc(s.name || '?')}</span> ${pkgKindBadge(s.kind)}`).join('<br>');
+        return shown + (list.length > 3 ? `<div class="text-[11px] text-gray-500 mt-0.5">+${list.length - 3} more</div>` : '');
+      })();
+
+  return `
+    <tr class="hover:bg-dark-hover transition-colors cursor-pointer" onclick="navigateTo('component', ${jsStr(r.marketplaceId)}, { selectedTab: 'structure' })">
+      <td class="px-4 py-3">
+        <a href="${href}" onclick="event.stopPropagation()" class="text-sm font-medium text-white hover:text-mx-blue">${esc(r.name)}</a>
+        <div class="text-xs text-gray-500 mt-0.5">${esc(r.contentType)} · ${esc(r.marketplaceId)}${r.team ? ` · ${esc(r.team)}` : ''}</div>
+      </td>
+      <td class="px-4 py-3 text-sm text-gray-300">${esc(r.publisher || '—')}</td>
+      <td class="px-4 py-3">${supportBadge(r.support)}</td>
+      <td class="px-4 py-3">${pkgDistBadge(r.dist)}</td>
+      <td class="px-4 py-3 text-sm">${focus}</td>
+      <td class="px-4 py-3">${pkgFormatBadge(r.packageFormat, r.packageFile)}</td>
+      <td class="px-4 py-3 text-sm text-gray-300">${esc(r.minMx || '—')}</td>
+      <td class="px-4 py-3 text-sm text-gray-300">${(r.downloads || 0).toLocaleString()}</td>
+      <td class="px-4 py-3 text-sm text-gray-400">${esc(formatDate(r.lastPublish) || '—')}</td>
+    </tr>`;
+}
+
+// ---------------------------------------------------------------------------
+// CSV export
+// ---------------------------------------------------------------------------
+
+// Escape one CSV field: quote when it contains a delimiter, quote or newline.
+function _csvCell(v) {
+  const s = v === null || v === undefined ? '' : String(v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// Build a CSV from column definitions and hand it to the browser as a download.
+// Used by the packaging pages; written generically so other list views can reuse it.
+function downloadCSV(fileName, columns, rows) {
+  const lines = [columns.map(c => _csvCell(c.label)).join(',')];
+  for (const row of rows) lines.push(columns.map(c => _csvCell(c.value(row))).join(','));
+  // A BOM keeps Excel from mangling non-ASCII publisher names.
+  const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function exportPackagingCSV(pageKey) {
+  const rows = _pkgFiltered(pageKey);
+  const columns = [
+    { label: 'Marketplace ID', value: r => r.marketplaceId },
+    { label: 'Component',      value: r => r.name },
+    { label: 'Delivery',       value: r => (PKG_DIST_META[r.dist] || {}).label || r.dist },
+    { label: 'Content type',   value: r => r.contentType },
+    { label: 'Publisher',      value: r => r.publisher },
+    { label: 'Support type',   value: r => r.support },
+    { label: 'Owning team',    value: r => r.team },
+    { label: 'Maintainers',    value: r => r.developers.join('; ') },
+    { label: 'Add-on modules', value: r => r.addOnModules.map(s => s.name).join('; ') },
+    { label: 'Solution modules', value: r => r.solutionModules.map(s => s.name).join('; ') },
+    { label: 'Extensions',     value: r => r.extensions.join('; ') },
+    { label: 'Package file',   value: r => r.packageFile },
+    { label: 'Package format', value: r => r.packageFormat },
+    { label: 'Min Mendix version', value: r => r.minMx },
+    { label: 'Downloads',      value: r => r.downloads },
+    { label: 'Last published', value: r => r.lastPublish },
+    { label: 'Marketplace URL', value: r => r.permalink },
+  ];
+  const stamp = window.SCAN_DATE ? String(window.SCAN_DATE).slice(0, 10) : 'export';
+  downloadCSV(`mx-${pageKey}-${stamp}.csv`, columns, rows);
+}
+
+// ---------------------------------------------------------------------------
+// Component detail — packaging card (shown on the Package Structure tab)
+// ---------------------------------------------------------------------------
+
+// The packaging facts for one component: how it is delivered, what each module in
+// it is, what is bundled inside, and how the archive is laid out. Returns '' when
+// there is nothing packaging-specific to say and the component is an ordinary one.
+function buildPackagingCard(comp, packagingModules) {
+  if (!dbLayer.hasPackagingData()) return '';
+
+  const settings = [];
+  const nested = [];
+  const layout = [];
+  const seen = new Set();
+  let archiveFiles = 0, archiveBytes = 0;
+  for (const m of packagingModules || []) {
+    for (const s of _parseJSON(m.package_modules_json)) {
+      const key = (s.name || '?') + '\x1f' + (s.source || '');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      settings.push(Object.assign({ kind: _pkgModuleKind(s) }, s));
+    }
+    for (const n of _parseJSON(m.nested_packages_json)) nested.push(n);
+    for (const l of _parseJSON(m.package_layout_json)) layout.push(l);
+    archiveFiles += m.archive_files || 0;
+    archiveBytes += m.archive_bytes || 0;
+  }
+
+  const dist = comp.distribution_type || 'regular';
+  const extensions = _parseJSON(comp.extension_names_json || '[]');
+  if (dist === 'regular' && !settings.length && !comp.package_file_name) return '';
+
+  const fact = (label, valueHtml) => `
+    <div>
+      <div class="text-[11px] uppercase tracking-wide text-gray-500">${label}</div>
+      <div class="text-sm text-gray-200 mt-0.5">${valueHtml}</div>
+    </div>`;
+
+  const protectedCount = settings.filter(s => s.kind === 'add-on').length;
+  const solutionCount  = settings.filter(s => s.kind === 'solution').length;
+
+  const facts = `
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+      ${fact('Delivered as', pkgDistBadge(dist))}
+      ${fact('Package file', comp.package_file_name
+          ? `<span class="font-mono text-xs text-gray-300">${esc(comp.package_file_name)}</span>`
+          : '<span class="text-gray-600">not recorded</span>')}
+      ${fact('Archive', archiveFiles ? `${archiveFiles.toLocaleString()} files · ${fmtBytes(archiveBytes)}` : '<span class="text-gray-600">—</span>')}
+      ${fact('Modules', settings.length
+          ? `${settings.length} total${protectedCount ? ` · ${protectedCount} protected` : ''}${solutionCount ? ` · ${solutionCount} solution` : ''}`
+          : '<span class="text-gray-600">—</span>')}
+    </div>`;
+
+  const moduleRows = settings.map(s => `
+    <tr class="hover:bg-dark-hover transition-colors">
+      <td class="px-3 py-2 text-sm text-gray-200">${esc(s.name || '?')}</td>
+      <td class="px-3 py-2">${pkgKindBadge(s.kind)}</td>
+      <td class="px-3 py-2 text-sm ${s.export_level === 'Protected' ? 'text-purple-300' : 'text-gray-400'}">${esc(s.export_level || '—')}</td>
+      <td class="px-3 py-2 text-sm text-gray-400">${esc(s.protected_module_type || '—')}</td>
+      <td class="px-3 py-2 text-sm text-gray-300">${s.extension_name ? `<span class="font-mono text-xs">${esc(s.extension_name)}</span>` : '<span class="text-gray-600">—</span>'}</td>
+      <td class="px-3 py-2 text-sm text-gray-400">${esc(s.version || '—')}</td>
+      <td class="px-3 py-2 text-xs text-gray-500">${s.source ? esc(s.source) : 'package model'}</td>
+    </tr>`).join('');
+
+  const modulesTable = settings.length ? `
+    <div class="mt-5">
+      <div class="text-sm font-medium text-gray-300 mb-2">Modules in this package</div>
+      <div class="overflow-x-auto rounded-lg border border-dark-border">
+        <table class="min-w-full">
+          <thead class="bg-dark-bg/50"><tr>
+            ${th('Module')}${th('Kind')}${th('Export level')}${th('Module type')}${th('Extension')}${th('Version')}${th('From')}
+          </tr></thead>
+          <tbody class="divide-y divide-dark-border">${moduleRows}</tbody>
+        </table>
+      </div>
+      <p class="text-[11px] text-gray-500 mt-2">
+        Export level is the reliable signal: <span class="text-gray-400">Protected</span> means the model ships compiled.
+        Module type stores "AddOn" by default, so on its own it does not mark a module as an add-on.
+      </p>
+    </div>` : '';
+
+  const nestedList = nested.length ? `
+    <div class="mt-5">
+      <div class="text-sm font-medium text-gray-300 mb-2">Packages bundled inside</div>
+      <div class="space-y-1.5">
+        ${nested.map(n => `
+          <div class="flex flex-wrap items-center gap-2 rounded-md border border-dark-border bg-dark-bg/40 px-3 py-2">
+            <span class="font-mono text-xs text-gray-300">${esc(n.path)}</span>
+            ${n.kind ? pkgKindBadge(n.kind) : ''}
+            ${n.extension_name ? `<span class="text-[11px] text-gray-400">extension: <span class="font-mono">${esc(n.extension_name)}</span></span>` : ''}
+            <span class="text-[11px] text-gray-500">${(n.file_count || 0).toLocaleString()} files · ${fmtBytes(n.size_bytes)}${n.model_mx_version ? ` · model ${esc(n.model_mx_version)}` : ''}</span>
+          </div>`).join('')}
+      </div>
+    </div>` : '';
+
+  // Merge layout entries across packages, then draw a proportional bar per folder.
+  const merged = {};
+  for (const l of layout) {
+    const e = merged[l.dir] || (merged[l.dir] = { dir: l.dir, files: 0, size_bytes: 0 });
+    e.files += l.files || 0;
+    e.size_bytes += l.size_bytes || 0;
+  }
+  const layoutRows = Object.values(merged).sort((a, b) => b.size_bytes - a.size_bytes);
+  const maxBytes = layoutRows.length ? Math.max(...layoutRows.map(l => l.size_bytes)) : 0;
+  const layoutHTML = layoutRows.length ? `
+    <div class="mt-5">
+      <div class="text-sm font-medium text-gray-300 mb-2">Archive layout</div>
+      <div class="space-y-1">
+        ${layoutRows.map(l => `
+          <div class="flex items-center gap-3">
+            <div class="w-40 flex-shrink-0 font-mono text-xs text-gray-300 truncate" title="${esc(l.dir)}">${esc(l.dir)}</div>
+            <div class="flex-1 h-2 rounded bg-dark-bg/60 overflow-hidden">
+              <div class="h-full bg-mx-blue/60" style="width:${maxBytes ? Math.max(2, Math.round(l.size_bytes / maxBytes * 100)) : 0}%"></div>
+            </div>
+            <div class="w-40 flex-shrink-0 text-right text-xs text-gray-500">${l.files.toLocaleString()} files · ${fmtBytes(l.size_bytes)}</div>
+          </div>`).join('')}
+      </div>
+    </div>` : '';
+
+  const extensionsHTML = extensions.length ? `
+    <div class="mt-4 text-sm text-gray-300">
+      Ships Studio Pro extension${extensions.length !== 1 ? 's' : ''}:
+      ${extensions.map(e => `<span class="font-mono text-xs bg-dark-bg/60 border border-dark-border rounded px-1.5 py-0.5 ml-1">${esc(e)}</span>`).join('')}
+    </div>` : '';
+
+  return card(`
+    <div class="p-4">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-sm font-semibold text-white">Packaging &amp; distribution</h3>
+        <span class="text-[11px] text-gray-500">from Module Settings in the model</span>
+      </div>
+      ${facts}
+      ${extensionsHTML}
+      ${modulesTable}
+      ${nestedList}
+      ${layoutHTML}
+    </div>`);
 }

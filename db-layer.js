@@ -176,6 +176,12 @@ class DatabaseLayer {
          c.published_version_count, c.support_contact, c.support_website,
          c.publisher_logo, c.publisher_url, c.license_name, c.license_url, c.developers_json,`
       : '';
+    // Packaging columns were added later; guard so older embedded DBs still work.
+    const pkgCols = this.hasPackagingData()
+      ? `c.distribution_type, c.package_file_name, c.package_format,
+         c.addon_module_count, c.solution_module_count,
+         COALESCE(c.extension_names_json, '[]') AS extension_names_json,`
+      : '';
     // Internal team ownership; guard for older DBs without the teams table.
     const hasTeams = this.columnExists('components', 'team_id');
     const teamSel = hasTeams
@@ -192,6 +198,7 @@ class DatabaseLayer {
         c.prod_apps_mx9, c.prod_apps_mx10,
         c.git_hub_url, c.last_publish_date, c.changed_date, c.created_date,
         ${richCols}
+        ${pkgCols}
         ${teamSel}
         COUNT(DISTINCT CASE WHEN m.has_userlib AND NOT COALESCE(m.has_managed_dependencies, 0) THEN m.id END) AS unmanaged_dep_count,
         COUNT(DISTINCT CASE WHEN m.has_userlib THEN m.id END)        AS userlib_module_count,
@@ -415,6 +422,67 @@ class DatabaseLayer {
 
   getDistinctSupportTypes() {
     return this.query(`SELECT DISTINCT support_type FROM components WHERE support_type IS NOT NULL ORDER BY support_type`);
+  }
+
+  // ── Packaging: add-on modules, solutions and Studio Pro extensions ──────────
+  //
+  // Whether the DB carries packaging analysis at all. Databases written before it
+  // existed have no distribution_type column, and the packaging pages hide.
+  hasPackagingData() {
+    return this.columnExists('components', 'distribution_type');
+  }
+
+  // Components whose packaging is anything other than an ordinary module/app —
+  // add-on modules, solution packages, and modules carrying a Studio Pro
+  // extension. One row per component; module-level detail comes from
+  // getPackagingModules() and is stitched in by the caller.
+  getPackagingComponents() {
+    if (!this.hasPackagingData()) return [];
+    const hasTeams = this.columnExists('components', 'team_id');
+    const teamSel = hasTeams ? `t.name AS owning_team,` : `'' AS owning_team,`;
+    const teamJoin = hasTeams ? `LEFT JOIN teams t ON t.id = c.team_id` : '';
+    return this.query(`
+      SELECT
+        c.id, c.marketplace_id, c.name, c.content_type, c.support_type, c.publisher,
+        c.min_mx_version, c.react_client_ready, c.download_count, c.rating,
+        c.permalink, c.latest_version, c.last_publish_date, c.created_date,
+        c.git_hub_url, c.developers_json,
+        c.distribution_type, c.package_file_name, c.package_format,
+        c.addon_module_count, c.solution_module_count,
+        COALESCE(c.extension_names_json, '[]') AS extension_names_json,
+        ${teamSel}
+        COUNT(DISTINCT m.id) AS module_count
+      FROM components c
+      LEFT JOIN modules m ON m.component_id = c.id
+      ${teamJoin}
+      WHERE COALESCE(c.distribution_type, 'regular') != 'regular'
+      GROUP BY c.id
+      ORDER BY c.download_count DESC
+    `);
+  }
+
+  // Per-module packaging rows. Without an id, returns them for every component
+  // that has a packaging signal (the list pages); with one, for that component
+  // alone (the detail page), regardless of its classification.
+  getPackagingModules(componentId = null) {
+    if (!this.hasPackagingData()) return [];
+    const where = componentId
+      ? `WHERE m.component_id = ?`
+      : `WHERE COALESCE(c.distribution_type, 'regular') != 'regular'`;
+    return this.query(`
+      SELECT
+        m.id, m.component_id, m.name, m.version, m.model_mx_version,
+        m.export_level, m.protected_module_type, m.module_kind, m.extension_name,
+        m.settings_version, m.archive_files, m.archive_bytes,
+        COALESCE(m.package_modules_json, '[]') AS package_modules_json,
+        COALESCE(m.nested_packages_json, '[]') AS nested_packages_json,
+        COALESCE(m.extension_names_json, '[]') AS extension_names_json,
+        COALESCE(m.package_layout_json, '[]')  AS package_layout_json
+      FROM modules m
+      JOIN components c ON c.id = m.component_id
+      ${where}
+      ORDER BY m.name
+    `, componentId ? [componentId] : []);
   }
 
   // Distinct owning-team names (for the Components-page team filter). Empty when
