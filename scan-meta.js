@@ -1,4 +1,4 @@
-window.SCAN_DATE = '2026-11-23T02:33:39Z';
+window.SCAN_DATE = '2026-11-24T02:30:40Z';
 
 // Public build: deep-link-only UI (injected by pkg/publish)
 window.PUBLIC_REPORT = true;
